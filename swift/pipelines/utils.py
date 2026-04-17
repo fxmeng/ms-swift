@@ -77,12 +77,13 @@ def _resolve_cache_path(raw_path):
     return path, dataset_sample
 
 
-def _try_load_packing(train_path, args):
-    """Load pre-computed packing metadata if it exists alongside a train cache."""
-    packing_path = train_path.rstrip('/') + '_packing'
-    if not os.path.exists(packing_path):
-        parent = os.path.dirname(train_path.rstrip('/'))
-        packing_path = os.path.join(parent, 'train_packing')
+def _try_load_packing(dataset_path, args):
+    """Load pre-computed packing metadata if it exists alongside a dataset cache.
+
+    Looks for ``<dataset_path>_packing`` only — no fallback, so val paths
+    like ``output_dir/val`` won't accidentally pick up ``output_dir/train_packing``.
+    """
+    packing_path = dataset_path.rstrip('/') + '_packing'
     if os.path.exists(packing_path):
         return load_from_disk(packing_path)
     return None
