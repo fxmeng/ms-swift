@@ -92,7 +92,11 @@ def _try_load_packing(dataset_path, args):
 def get_cached_dataset(args):
     train_datasets, val_datasets = [], []
     random_state = np.random.RandomState(args.data_seed)
-    for cached_dataset, datasets in zip([args.cached_dataset, args.cached_val_dataset], [train_datasets, val_datasets]):
+    dataset_groups = [
+        (args.cached_dataset, train_datasets, True),
+        (args.cached_val_dataset, val_datasets, False),
+    ]
+    for cached_dataset, datasets, is_train in dataset_groups:
         for raw_path in cached_dataset:
             path, dataset_sample = _resolve_cache_path(raw_path)
             arrow_dataset = load_from_disk(path)
@@ -106,7 +110,7 @@ def get_cached_dataset(args):
                         random_state=random_state, shuffle_all=True)
                 dataset = CachedEncodedDataset(arrow_dataset)
                 dataset_modified = len(arrow_dataset) != original_len
-                if getattr(args, 'packing', False):
+                if is_train and getattr(args, 'packing', False):
                     if dataset_modified:
                         logger.info(
                             f'Dataset `{path}` was filtered/sampled ({original_len} -> {len(arrow_dataset)}). '
