@@ -1,0 +1,81 @@
+# Full encode caching for Megatron multimodal training (ms-swift>=3.12)
+#
+# Step 1: Pre-tokenize text, serialize media tensors, and compute packing groups.
+#         This produces Arrow files that training can load with zero preprocessing.
+#
+# Step 2: Train with the cached data — no lazy tokenization, no image processing,
+#         no packing computation at startup.
+
+# --- Step 1: Export fully-encoded cached dataset (single GPU, run once) ---
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
+FPS_MAX_FRAMES=16 \
+swift export \
+    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --dataset 'AI-ModelScope/alpaca-gpt4-data-zh#10000' \
+              'AI-ModelScope/LaTeX_OCR:human_handwrite#5000' \
+              'swift/VideoChatGPT:Generic#2000' \
+    --split_dataset_ratio 0.01 \
+    --dataset_num_proc 8 \
+    --to_cached_dataset true \
+    --full_encode true \
+    --packing true \
+    --max_length 4096 \
+    --output_dir ./qwen3_vl_full_cached
+
+# Output structure:
+#   qwen3_vl_full_cached/
+#     train/            — Arrow dataset (input_ids, labels, pixel_values_bytes, ...)
+#     train_packing/    — Arrow dataset (packed_idx, packed_length)
+#     val/              — Arrow dataset (validation split)
+#     cache_meta.json   — metadata (full_encode, packing, max_length, model)
+
+
+# --- Step 2: Train with pre-cached data (multi-GPU) ---
+# 8 * 80GiB
+PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
+OMP_NUM_THREADS=14 \
+NPROC_PER_NODE=8 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+IMAGE_MAX_TOKEN_NUM=1024 \
+VIDEO_MAX_TOKEN_NUM=128 \
+FPS_MAX_FRAMES=16 \
+megatron sft \
+    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --save_safetensors true \
+    --cached_dataset './qwen3_vl_full_cached/train' \
+    --cached_val_dataset './qwen3_vl_full_cached/val' \
+    --load_from_cache_file true \
+    --split_dataset_ratio 0.01 \
+    --moe_permute_fusion true \
+    --tensor_model_parallel_size 2 \
+    --expert_model_parallel_size 8 \
+    --moe_grouped_gemm true \
+    --moe_shared_expert_overlap true \
+    --moe_aux_loss_coeff 1e-6 \
+    --micro_batch_size 1 \
+    --global_batch_size 4 \
+    --recompute_granularity full \
+    --recompute_method uniform \
+    --recompute_num_layers 1 \
+    --num_train_epochs 1 \
+    --finetune true \
+    --cross_entropy_loss_fusion true \
+    --lr 1e-5 \
+    --lr_warmup_fraction 0.05 \
+    --min_lr 1e-6 \
+    --output_dir megatron_output/Qwen3-VL-30B-A3B-Instruct \
+    --eval_steps 500 \
+    --save_steps 500 \
+    --max_length 4096 \
+    --packing true \
+    --dataloader_num_workers 8 \
+    --dataset_num_proc 8 \
+    --no_save_optim true \
+    --no_save_rng true \
+    --sequence_parallel true \
+    --moe_expert_capacity_factor 2 \
+    --optimizer_cpu_offload true \
+    --use_precision_aware_optimizer true \
+    --optimizer_offload_fraction 0.2 \
+    --attention_backend flash

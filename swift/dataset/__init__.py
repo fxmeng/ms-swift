@@ -10,8 +10,8 @@ from .preprocessor import (AlpacaPreprocessor, AutoPreprocessor, MessagesPreproc
                            RowPreprocessor)
 from .register import (DATASET_MAPPING, DatasetMeta, SubsetDataset, get_dataset_list, register_dataset,
                        register_dataset_info)
-from .utils import (AddLengthPreprocessor, EncodePreprocessor, LazyLLMDataset, get_temporary_cache_files_directory,
-                    sample_dataset)
+from .utils import (AddLengthPreprocessor, CachedEncodedDataset, CachedPackingDataset, EncodePreprocessor,
+                    FullEncodePreprocessor, LazyLLMDataset, get_temporary_cache_files_directory, sample_dataset)
 
 datasets.fingerprint.get_temporary_cache_files_directory = get_temporary_cache_files_directory
 datasets.arrow_dataset.get_temporary_cache_files_directory = get_temporary_cache_files_directory

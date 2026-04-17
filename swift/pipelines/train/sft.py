@@ -3,9 +3,11 @@ import os
 from datasets import Dataset as HfDataset
 from typing import List, Optional, Union
 
+from torch.utils.data import ConcatDataset
+
 from swift.arguments import SftArguments
-from swift.dataset import (AddLengthPreprocessor, DatasetLoader, EncodePreprocessor, IterablePackingDataset,
-                           LazyLLMDataset, PackingDataset, load_dataset)
+from swift.dataset import (AddLengthPreprocessor, CachedEncodedDataset, CachedPackingDataset, DatasetLoader,
+                           EncodePreprocessor, IterablePackingDataset, LazyLLMDataset, PackingDataset, load_dataset)
 from swift.infer_engine import prepare_generation_config
 from swift.ray import RayHelper
 from swift.sequence_parallel import sequence_parallel
@@ -106,6 +108,18 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             append_to_jsonl(val_dataset_path, val_dataset.to_list())
             logger.info(f'The split dataset from the training set will be saved at: {val_dataset_path}.')
 
+    @staticmethod
+    def _safe_concat_datasets(datasets_list):
+        """Concatenate datasets, handling both HfDataset and torch Dataset (CachedEncodedDataset etc.)."""
+        if len(datasets_list) == 0:
+            return None
+        if len(datasets_list) == 1:
+            return datasets_list[0]
+        has_torch_ds = any(isinstance(ds, (CachedEncodedDataset, CachedPackingDataset)) for ds in datasets_list)
+        if has_torch_ds:
+            return ConcatDataset(datasets_list)
+        return DatasetLoader.concat_datasets(datasets_list)
+
     @RayHelper.function(group='default')
     def _prepare_dataset(self):
         args = self.args
@@ -123,8 +137,8 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 train_datasets.append(train_dataset)
             if val_dataset is not None:
                 val_datasets.append(val_dataset)
-        train_dataset = DatasetLoader.concat_datasets(train_datasets)
-        val_dataset = DatasetLoader.concat_datasets(val_datasets)
+        train_dataset = self._safe_concat_datasets(train_datasets)
+        val_dataset = self._safe_concat_datasets(val_datasets)
         if args.truncation_strategy != 'split':
             logger.info(f'train_dataset: {train_dataset}')
             logger.info(f'val_dataset: {val_dataset}')
@@ -134,6 +148,24 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         datasets = self._post_process_datasets(datasets)
         self._show_dataset(*datasets)
         return datasets
+
+    @staticmethod
+    def _is_fully_cached(dataset) -> bool:
+        """Check if a dataset is fully pre-encoded (tokenized + media serialized)."""
+        if isinstance(dataset, (CachedEncodedDataset, CachedPackingDataset)):
+            return True
+        if isinstance(dataset, ConcatDataset):
+            return all(
+                isinstance(ds, (CachedEncodedDataset, CachedPackingDataset)) for ds in dataset.datasets)
+        return False
+
+    @staticmethod
+    def _has_precomputed_packing(dataset) -> bool:
+        if isinstance(dataset, CachedPackingDataset):
+            return True
+        if isinstance(dataset, ConcatDataset):
+            return all(isinstance(ds, CachedPackingDataset) for ds in dataset.datasets)
+        return False
 
     def _post_process_datasets(self, datasets: List) -> List:
         args = self.args
@@ -145,6 +177,31 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 continue
             if i == 1 and predict_with_generate:
                 # val_dataset
+                continue
+            if self._is_fully_cached(dataset):
+                if self._has_precomputed_packing(dataset):
+                    template.packing = True
+                    template.padding_free = True
+                    datasets[i] = dataset
+                    continue
+                if args.packing:
+                    packing_kwargs = dict(
+                        num_proc=args.dataset_num_proc,
+                        packing_length=args.packing_length,
+                        packing_num_proc=args.packing_num_proc,
+                        strict=args.strict,
+                        load_from_cache_file=args.load_from_cache_file)
+                    if isinstance(dataset, ConcatDataset):
+                        packed_subs = []
+                        for ds in dataset.datasets:
+                            if isinstance(ds, CachedPackingDataset):
+                                packed_subs.append(ds)
+                            else:
+                                packed_subs.append(PackingDataset(template, ds, **packing_kwargs))
+                        dataset = ConcatDataset(packed_subs)
+                    else:
+                        dataset = PackingDataset(template, dataset, **packing_kwargs)
+                datasets[i] = dataset
                 continue
             if not args.streaming and args.truncation_strategy != 'split':
                 dataset = LazyLLMDataset(dataset, template.encode, strict=args.strict, random_state=args.data_seed)
@@ -276,14 +333,25 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         return res
 
     @staticmethod
-    def _stat_dataset(dataset: Union[HfDataset, PackingDataset, LazyLLMDataset]):
+    def _get_lengths(dataset):
         if isinstance(dataset, LazyLLMDataset):
             dataset = dataset.dataset
+        if isinstance(dataset, CachedPackingDataset):
+            return list(dataset.packed_length)
+        if isinstance(dataset, CachedEncodedDataset):
+            return [max(l) if isinstance(l, list) else l for l in dataset.dataset['lengths']]
+        if isinstance(dataset, ConcatDataset):
+            lengths = []
+            for ds in dataset.datasets:
+                lengths.extend(SwiftSft._get_lengths(ds))
+            return lengths
         if isinstance(dataset, HfDataset):
-            lengths = dataset['lengths']
-            lengths = [max(length) if isinstance(length, list) else length for length in lengths]
-        else:
-            lengths = dataset.packed_length
+            return [max(l) if isinstance(l, list) else l for l in dataset['lengths']]
+        return list(dataset.packed_length)
+
+    @staticmethod
+    def _stat_dataset(dataset: Union[HfDataset, PackingDataset, LazyLLMDataset]):
+        lengths = SwiftSft._get_lengths(dataset)
         _, stat_str = stat_array(lengths)
         logger.info(f'Dataset Token Length: {stat_str}')
         return stat_str

@@ -27,6 +27,10 @@ class ExportArguments(MergeArguments, BaseArguments):
         to_cached_dataset (bool): Whether to tokenize and export the dataset in advance as a cached dataset. Defaults
             to False. Note: You can specify the validation set content through
             `--split_dataset_ratio` or `--val_dataset`.
+        full_encode (bool): When used with `to_cached_dataset`, fully tokenizes text, serializes multimodal tensors
+            (pixel_values, grid_thw) as binary, and optionally pre-computes packing groups. Training can then load the
+            cached data with zero preprocessing overhead. Allows `--packing` to pre-compute packing groups.
+            Defaults to False.
         to_ollama (bool): Whether to generate the `Modelfile` required by Ollama. Defaults to False.
         to_mcore (bool): Whether to convert Hugging Face format weights to Megatron-Core format. Defaults to False.
         to_hf (bool): Whether to convert Megatron-Core format weights to Hugging Face format. Defaults to False.
@@ -58,6 +62,7 @@ class ExportArguments(MergeArguments, BaseArguments):
 
     # cached_dataset
     to_cached_dataset: bool = False
+    full_encode: bool = False
     template_mode: Literal['train', 'rlhf', 'kto'] = 'train'
 
     # ollama
@@ -144,7 +149,8 @@ class ExportArguments(MergeArguments, BaseArguments):
             raise ValueError(f'self.dataset: {self.dataset}, Please input the quant dataset.')
         if self.to_cached_dataset:
             self.lazy_tokenize = False
-            if self.packing:
+            if self.packing and not self.full_encode:
                 raise ValueError('Packing will be handled during training; here we only perform tokenization '
-                                 'in advance, so you do not need to set up packing separately.')
+                                 'in advance, so you do not need to set up packing separately. '
+                                 'If you want to pre-compute packing groups, use --full_encode true.')
             assert not self.streaming, 'not supported'

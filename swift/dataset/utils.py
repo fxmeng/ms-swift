@@ -3,10 +3,11 @@ import inspect
 import numpy as np
 import os
 import tempfile
+import torch
 from datasets import Dataset as HfDataset
 from modelscope.hub.utils.utils import get_cache_dir
 from torch.utils.data import Dataset
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from swift.template import MaxLengthError, Template
 from swift.utils import get_logger
@@ -128,6 +129,106 @@ class AddLengthPreprocessor(EncodePreprocessor):
         encoded = super().preprocess(row)
         row['lengths'] = encoded['lengths']
         return row
+
+
+class FullEncodePreprocessor(EncodePreprocessor):
+    """Fully encode and serialize multimodal tensors for Arrow storage.
+
+    Produces a flat dict with tokenized text fields and binary-serialized
+    tensor fields that can be stored directly in Arrow format. Training can
+    then reconstruct tensors from bytes with zero image/video processing.
+    """
+
+    _TENSOR_FIELDS = [
+        ('pixel_values', 'pixel_values_bytes', 'pixel_values_shape'),
+        ('pixel_values_videos', 'pixel_values_videos_bytes', 'pixel_values_videos_shape'),
+    ]
+    _THW_FIELDS = ['image_grid_thw', 'video_grid_thw']
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        encoded = super().preprocess(row)
+        if encoded is None:
+            return None
+        result: Dict[str, Any] = {
+            'input_ids': encoded['input_ids'],
+            'labels': encoded['labels'],
+            'lengths': encoded['lengths'],
+            'loss_scale': encoded.get('loss_scale'),
+        }
+
+        for tensor_key, bytes_key, shape_key in self._TENSOR_FIELDS:
+            val = encoded.get(tensor_key)
+            if val is not None and isinstance(val, torch.Tensor):
+                t = val.to(torch.float16)
+                result[bytes_key] = t.numpy().tobytes()
+                result[shape_key] = list(t.shape)
+            else:
+                result[bytes_key] = None
+                result[shape_key] = None
+
+        for thw_key in self._THW_FIELDS:
+            val = encoded.get(thw_key)
+            if val is not None:
+                result[thw_key] = val.tolist() if isinstance(val, torch.Tensor) else val
+            else:
+                result[thw_key] = None
+
+        return result
+
+
+class CachedEncodedDataset(Dataset):
+    """Wraps a fully-encoded Arrow dataset, reconstructing tensors from bytes on access."""
+
+    def __init__(self, arrow_dataset: HfDataset):
+        self.dataset = arrow_dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, str):
+            return self.dataset[idx]
+        row = self.dataset[idx]
+        result: Dict[str, Any] = {
+            'input_ids': row['input_ids'],
+            'labels': row['labels'],
+            'length': max(row['lengths']) if isinstance(row['lengths'], list) else row['lengths'],
+        }
+        if 'loss_scale' in row and row['loss_scale'] is not None:
+            result['loss_scale'] = row['loss_scale']
+
+        if row.get('pixel_values_bytes') is not None:
+            shape = row['pixel_values_shape']
+            arr = np.frombuffer(row['pixel_values_bytes'], dtype=np.float16).reshape(shape)
+            result['pixel_values'] = torch.from_numpy(arr.copy())
+        if row.get('image_grid_thw') is not None:
+            result['image_grid_thw'] = torch.tensor(row['image_grid_thw'])
+
+        if row.get('pixel_values_videos_bytes') is not None:
+            shape = row['pixel_values_videos_shape']
+            arr = np.frombuffer(row['pixel_values_videos_bytes'], dtype=np.float16).reshape(shape)
+            result['pixel_values_videos'] = torch.from_numpy(arr.copy())
+        if row.get('video_grid_thw') is not None:
+            result['video_grid_thw'] = torch.tensor(row['video_grid_thw'])
+
+        return result
+
+
+class CachedPackingDataset(Dataset):
+    """Packing dataset that uses pre-computed packing groups from Arrow."""
+
+    def __init__(self, cached_dataset: 'CachedEncodedDataset', packing_arrow: HfDataset):
+        self.dataset = cached_dataset
+        self.packed_idx: List[List[int]] = packing_arrow['packed_idx']
+        self.packed_length: List[int] = packing_arrow['packed_length']
+        logger.info(f'CachedPackingDataset: {len(cached_dataset)} samples -> {len(self.packed_idx)} packed groups')
+
+    def __len__(self) -> int:
+        return len(self.packed_idx)
+
+    def __getitem__(self, index) -> List[Dict[str, Any]]:
+        indices = self.packed_idx[index]
+        return [self.dataset[i] for i in indices]
 
 
 TEMP_DIR_POOL = {}
