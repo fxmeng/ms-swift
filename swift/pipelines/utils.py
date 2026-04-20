@@ -92,12 +92,17 @@ def _try_load_packing(dataset_path, args):
 def get_cached_dataset(args):
     train_datasets, val_datasets = [], []
     random_state = np.random.RandomState(args.data_seed)
+    cached_packing_paths = getattr(args, 'cached_packing_dataset', None) or []
+    if cached_packing_paths and len(cached_packing_paths) != len(args.cached_dataset):
+        raise ValueError(
+            f'cached_packing_dataset has {len(cached_packing_paths)} entries but '
+            f'cached_dataset has {len(args.cached_dataset)} entries; they must match 1:1.')
     dataset_groups = [
         (args.cached_dataset, train_datasets, True),
         (args.cached_val_dataset, val_datasets, False),
     ]
-    for cached_dataset, datasets, is_train in dataset_groups:
-        for raw_path in cached_dataset:
+    for cached_paths, datasets, is_train in dataset_groups:
+        for i, raw_path in enumerate(cached_paths):
             path, dataset_sample = _resolve_cache_path(raw_path)
             arrow_dataset = load_from_disk(path)
 
@@ -116,7 +121,10 @@ def get_cached_dataset(args):
                             f'Dataset `{path}` was filtered/sampled ({original_len} -> {len(arrow_dataset)}). '
                             'Pre-computed packing metadata will not be used; packing will be computed at training time.')
                     else:
-                        packing_arrow = _try_load_packing(path, args)
+                        if cached_packing_paths:
+                            packing_arrow = load_from_disk(cached_packing_paths[i])
+                        else:
+                            packing_arrow = _try_load_packing(path, args)
                         if packing_arrow is not None:
                             dataset = CachedPackingDataset(dataset, packing_arrow)
                         else:

@@ -1,9 +1,12 @@
 # Full encode caching for Megatron multimodal training (ms-swift>=3.12)
 #
-# Step 1: Pre-tokenize text, serialize media tensors, and compute packing groups.
+# Step 1: Pre-tokenize text, serialize media tensors.
 #         This produces Arrow files that training can load with zero preprocessing.
 #
-# Step 2: Train with the cached data — no lazy tokenization, no image processing,
+# Step 2: Compute packing groups from the cached train dataset.
+#         This reads the Arrow files from Step 1 and produces packing metadata.
+#
+# Step 3: Train with the cached data — no lazy tokenization, no image processing,
 #         no packing computation at startup.
 
 # --- Step 1: Export fully-encoded cached dataset (single GPU, run once) ---
@@ -19,19 +22,34 @@ swift export \
     --dataset_num_proc 8 \
     --to_cached_dataset true \
     --full_encode true \
-    --packing true \
     --max_length 4096 \
     --output_dir ./qwen3_vl_full_cached
 
-# Output structure:
+# Output structure after Step 1:
 #   qwen3_vl_full_cached/
 #     train/            — Arrow dataset (input_ids, labels, pixel_values_bytes, ...)
-#     train_packing/    — Arrow dataset (packed_idx, packed_length)
 #     val/              — Arrow dataset (validation split)
-#     cache_meta.json   — metadata (full_encode, packing, max_length, model)
+#     cache_meta.json   — metadata (full_encode, max_length, model)
 
 
-# --- Step 2: Train with pre-cached data (multi-GPU) ---
+# --- Step 2: Compute packing groups from cached train dataset ---
+swift export \
+    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --cached_dataset './qwen3_vl_full_cached/train' \
+    --to_cached_dataset true \
+    --full_encode true \
+    --packing true \
+    --max_length 4096
+
+# Output structure after Step 2:
+#   qwen3_vl_full_cached/
+#     train/            — (unchanged from Step 1)
+#     train_packing/    — Arrow dataset (packed_idx, packed_length)
+#     val/              — (unchanged from Step 1)
+#     cache_meta.json   — (unchanged from Step 1)
+
+
+# --- Step 3: Train with pre-cached data (multi-GPU) ---
 # 8 * 80GiB
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 OMP_NUM_THREADS=14 \
@@ -45,6 +63,7 @@ megatron sft \
     --save_safetensors true \
     --cached_dataset './qwen3_vl_full_cached/train' \
     --cached_val_dataset './qwen3_vl_full_cached/val' \
+    --cached_packing_dataset './qwen3_vl_full_cached/train_packing' \
     --load_from_cache_file true \
     --split_dataset_ratio 0.01 \
     --moe_permute_fusion true \

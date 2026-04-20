@@ -2,7 +2,7 @@
 import json
 import os
 import torch
-from datasets import Dataset as HfDataset
+from datasets import Dataset as HfDataset, load_from_disk
 from tqdm import tqdm
 from typing import List, Optional, Union
 
@@ -25,6 +25,8 @@ class ExportCachedDataset(SwiftSft):
         super(SwiftSft, self).__init__(args)
         args = self.args
         self.train_msg = {}  # dummy
+        if args.cached_dataset and args.packing:
+            return
         template_cls = args.template_meta.template_cls
         if template_cls and template_cls.use_model:
             kwargs = {'return_dummy_model': True}
@@ -69,9 +71,32 @@ class ExportCachedDataset(SwiftSft):
         template.model = origin_template_model
         return datasets
 
-    def main(self):
-        train_dataset, val_dataset = self._prepare_dataset()
+    def _compute_packing_from_cache(self):
+        """Compute packing groups from an already-cached dataset (packing-only mode)."""
         args = self.args
+        for raw_path in args.cached_dataset:
+            path = raw_path.rstrip('/')
+            arrow_dataset = load_from_disk(path)
+            packing_length = getattr(args, 'packing_length', None) or args.max_length
+            packed_idx, packed_length = _compute_packing_groups(arrow_dataset, packing_length)
+            logger.info(f'{len(arrow_dataset)} samples -> {len(packed_idx)} packed groups '
+                        f'(packing_length={packing_length})')
+            packing_ds = HfDataset.from_dict({
+                'packed_idx': packed_idx,
+                'packed_length': packed_length,
+            })
+            packing_path = path + '_packing'
+            packing_ds.save_to_disk(packing_path)
+            logger.info(f'packing metadata: `{packing_path}`')
+
+    def main(self):
+        args = self.args
+
+        if args.cached_dataset and args.packing:
+            self._compute_packing_from_cache()
+            return
+
+        train_dataset, val_dataset = self._prepare_dataset()
         os.makedirs(args.output_dir, exist_ok=True)
 
         train_data_dir = os.path.join(args.output_dir, 'train')

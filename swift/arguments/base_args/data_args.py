@@ -32,6 +32,9 @@ class DataArguments:
             ms-swift only stores an extra 'length' field and filters out erroneous samples
             to reduce storage. Actual preprocessing happens concurrently with training.
         cached_val_dataset (List[str]): Folder path(s) for cached validation datasets, default is [].
+        cached_packing_dataset (List[str]): Folder path(s) for pre-computed packing metadata, default is [].
+            Each entry corresponds 1:1 to a ``cached_dataset`` entry. When provided, these explicit paths
+            are used instead of auto-discovering ``<cached_dataset_path>_packing``.
         split_dataset_ratio (float): The ratio to split from the training set for validation if `val_dataset` is not
             provided. Defaults to 0.0. Note: The default was 0.01 in `ms-swift<3.6`.
         data_seed (int): The random seed for dataset shuffling. Defaults to 42.
@@ -74,6 +77,7 @@ class DataArguments:
     val_dataset: List[str] = field(default_factory=list)
     cached_dataset: List[str] = field(default_factory=list)
     cached_val_dataset: List[str] = field(default_factory=list)
+    cached_packing_dataset: List[str] = field(default_factory=list)
     split_dataset_ratio: float = 0.
 
     data_seed: int = 42

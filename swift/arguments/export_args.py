@@ -93,6 +93,8 @@ class ExportArguments(MergeArguments, BaseArguments):
         super().load_args_from_ckpt()
 
     def _init_output_dir(self):
+        if self.to_cached_dataset and self.cached_dataset and self.packing:
+            return
         if self.output_dir is None:
             ckpt_dir = self.ckpt_dir or f'./{self.model_suffix}'
             ckpt_dir, ckpt_name = os.path.split(ckpt_dir)
