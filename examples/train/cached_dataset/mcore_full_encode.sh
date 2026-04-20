@@ -39,7 +39,8 @@ swift export \
     --to_cached_dataset true \
     --full_encode true \
     --packing true \
-    --max_length 4096
+    --max_length 4096 \
+    --output_dir ./qwen3_vl_full_cached/train_packing
 
 # Output structure after Step 2:
 #   qwen3_vl_full_cached/

@@ -94,6 +94,11 @@ class ExportArguments(MergeArguments, BaseArguments):
 
     def _init_output_dir(self):
         if self.to_cached_dataset and self.cached_dataset and self.packing:
+            if self.output_dir is not None:
+                self.output_dir = to_abspath(self.output_dir)
+                if not self.exist_ok and os.path.exists(self.output_dir):
+                    raise FileExistsError(f'args.output_dir: `{self.output_dir}` already exists.')
+                logger.info(f'args.output_dir: `{self.output_dir}`')
             return
         if self.output_dir is None:
             ckpt_dir = self.ckpt_dir or f'./{self.model_suffix}'

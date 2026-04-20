@@ -74,7 +74,7 @@ class ExportCachedDataset(SwiftSft):
     def _compute_packing_from_cache(self):
         """Compute packing groups from an already-cached dataset (packing-only mode)."""
         args = self.args
-        for raw_path in args.cached_dataset:
+        for i, raw_path in enumerate(args.cached_dataset):
             path = raw_path.rstrip('/')
             arrow_dataset = load_from_disk(path)
             packing_length = getattr(args, 'packing_length', None) or args.max_length
@@ -85,7 +85,14 @@ class ExportCachedDataset(SwiftSft):
                 'packed_idx': packed_idx,
                 'packed_length': packed_length,
             })
-            packing_path = path + '_packing'
+            if args.output_dir is not None:
+                if len(args.cached_dataset) == 1:
+                    packing_path = args.output_dir
+                else:
+                    packing_path = os.path.join(args.output_dir, f'packing_{i}')
+                os.makedirs(os.path.dirname(packing_path) or '.', exist_ok=True)
+            else:
+                packing_path = path + '_packing'
             packing_ds.save_to_disk(packing_path)
             logger.info(f'packing metadata: `{packing_path}`')
 
