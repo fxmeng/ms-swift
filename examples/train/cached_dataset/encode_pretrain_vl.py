@@ -50,7 +50,10 @@ Example:
 
 import argparse
 import json
+import math
 import os
+import shutil
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -391,7 +394,12 @@ def main():
     parser.add_argument('--min_pixels', type=int, default=None,
                         help='Floor image_processor resolution (e.g. 65536 = 256*256).')
     parser.add_argument('--val_ratio', type=float, default=0.0,
-                        help='If > 0, randomly hold out this ratio into {output_dir}/val.')
+                        help='If > 0, randomly hold out this ratio into {output_dir}/val (non-shard '
+                             'mode) or into each shard\'s val/ subdir (shard mode).')
+    parser.add_argument('--shard_rows', type=int, default=0,
+                        help='Enable resumable shard mode: slice the source dataset into chunks of '
+                             'this many rows and process / save each chunk independently. 0 disables '
+                             'shard mode (legacy single-pass behavior). Typical value: 200000-500000.')
     parser.add_argument('--max_shard_size', type=str, default='2GB',
                         help='save_to_disk shard size (default datasets value is 500MB). Larger '
                              'shards mean fewer arrow files, which matters for multi-TB caches '
@@ -447,48 +455,167 @@ def main():
     def _map_fn(batch):
         return _build_batch(batch, model_id, image_root, strict, io_threads)
 
-    dataset = dataset.map(
-        _map_fn,
-        batched=True,
-        batch_size=args.batch_size,
-        num_proc=args.num_proc,
-        remove_columns=dataset.column_names,
-        features=OUTPUT_FEATURES,
-        writer_batch_size=args.writer_batch_size,
-        desc='Encoding',
-    )
-    dataset = dataset.filter(lambda r: r['input_ids'] is not None, num_proc=args.num_proc)
+    def _encode_and_save(src, out_dir, desc):
+        """Apply map+filter to `src` and atomically materialize train[/val] subdirs at `out_dir`.
+
+        Atomicity: we write to ``out_dir + '.tmp'`` and ``os.rename`` on success.
+        A crash therefore leaves at most a ``.tmp`` sibling, never a half-finished
+        ``out_dir``. The caller uses ``os.path.exists(out_dir)`` as the "done"
+        marker when resuming.
+        """
+        tmp_dir = out_dir + '.tmp'
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        processed = src.map(
+            _map_fn,
+            batched=True,
+            batch_size=args.batch_size,
+            num_proc=args.num_proc,
+            remove_columns=src.column_names,
+            features=OUTPUT_FEATURES,
+            writer_batch_size=args.writer_batch_size,
+            desc=desc,
+        )
+        processed = processed.filter(
+            lambda r: r['input_ids'] is not None, num_proc=args.num_proc)
+
+        save_kwargs = {
+            'max_shard_size': args.max_shard_size,
+            'num_proc': args.save_num_proc,
+        }
+
+        train_n = val_n = 0
+        if args.val_ratio and args.val_ratio > 0 and len(processed) > 1:
+            split = processed.train_test_split(
+                test_size=args.val_ratio, seed=args.seed, shuffle=True)
+            split['train'].save_to_disk(os.path.join(tmp_dir, 'train'), **save_kwargs)
+            split['test'].save_to_disk(os.path.join(tmp_dir, 'val'),
+                                       max_shard_size=args.max_shard_size)
+            train_n, val_n = len(split['train']), len(split['test'])
+        else:
+            processed.save_to_disk(os.path.join(tmp_dir, 'train'), **save_kwargs)
+            train_n = len(processed)
+
+        os.rename(tmp_dir, out_dir)
+        return train_n, val_n
 
     os.makedirs(args.output_dir, exist_ok=True)
-    train_dir = os.path.join(args.output_dir, 'train')
-    val_dir = os.path.join(args.output_dir, 'val')
-    save_kwargs = {
-        'max_shard_size': args.max_shard_size,
-        'num_proc': args.save_num_proc,
-    }
-    if args.val_ratio and args.val_ratio > 0:
-        split = dataset.train_test_split(test_size=args.val_ratio, seed=args.seed, shuffle=True)
-        split['train'].save_to_disk(train_dir, **save_kwargs)
-        # Val set is tiny — no need to parallelize, and multi-proc save has
-        # per-worker startup cost that dominates for small outputs.
-        split['test'].save_to_disk(val_dir, max_shard_size=args.max_shard_size)
-        print(f'cached_dataset:     `{train_dir}` ({len(split["train"])} samples)')
-        print(f'cached_val_dataset: `{val_dir}` ({len(split["test"])} samples)')
-    else:
-        dataset.save_to_disk(train_dir, **save_kwargs)
-        print(f'cached_dataset: `{train_dir}` ({len(dataset)} samples)')
 
-    meta = {
-        'full_encode': True,
-        'packing': False,
-        'model': args.model,
-        'source_dataset': args.source_dataset,
-        'image_root': args.image_root,
-    }
-    meta_path = os.path.join(args.output_dir, 'cache_meta.json')
-    with open(meta_path, 'w') as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
-    print(f'cache metadata: `{meta_path}`')
+    if args.shard_rows and args.shard_rows > 0:
+        # ---- shard mode: resumable, incremental ----
+        shard_rows = args.shard_rows
+        num_shards = math.ceil(len(dataset) / shard_rows)
+        shards_root = os.path.join(args.output_dir, 'shards')
+        os.makedirs(shards_root, exist_ok=True)
+
+        train_paths: List[str] = []
+        val_paths: List[str] = []
+
+        done, total_train, total_val = 0, 0, 0
+        wall_t0 = time.time()
+        for i in range(num_shards):
+            shard_dir = os.path.join(shards_root, f'shard-{i:06d}-of-{num_shards:06d}')
+            train_sub = os.path.join(shard_dir, 'train')
+            val_sub = os.path.join(shard_dir, 'val')
+
+            if os.path.exists(shard_dir):
+                # Shard was completed in a previous run. Skip re-computation;
+                # still record its paths so the summary / meta is correct.
+                if os.path.exists(train_sub):
+                    train_paths.append(train_sub)
+                if os.path.exists(val_sub):
+                    val_paths.append(val_sub)
+                done += 1
+                print(f'[shard {i+1}/{num_shards}] skip (already done): {shard_dir}')
+                continue
+
+            start = i * shard_rows
+            end = min(start + shard_rows, len(dataset))
+            shard_src = dataset.select(range(start, end))
+
+            t0 = time.time()
+            tn, vn = _encode_and_save(
+                shard_src, shard_dir, desc=f'shard {i+1}/{num_shards}')
+            dt = time.time() - t0
+            total_train += tn
+            total_val += vn
+            done += 1
+            if os.path.exists(train_sub):
+                train_paths.append(train_sub)
+            if os.path.exists(val_sub):
+                val_paths.append(val_sub)
+
+            # Simple ETA extrapolation across not-yet-done shards.
+            avg = (time.time() - wall_t0) / max(1, done)
+            remain = (num_shards - done) * avg
+            print(
+                f'[shard {i+1}/{num_shards}] done in {dt:.1f}s '
+                f'(train={tn}, val={vn}, avg={avg:.1f}s/shard, '
+                f'ETA={remain/3600:.1f}h) -> {shard_dir}')
+
+        meta = {
+            'full_encode': True,
+            'packing': False,
+            'model': args.model,
+            'source_dataset': args.source_dataset,
+            'image_root': args.image_root,
+            'shard_rows': shard_rows,
+            'num_shards': num_shards,
+            'train_shard_paths': train_paths,
+            'val_shard_paths': val_paths,
+            'total_train_samples': total_train,
+            'total_val_samples': total_val,
+        }
+        meta_path = os.path.join(args.output_dir, 'cache_meta.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        print(f'\ncache metadata: `{meta_path}`')
+        print(f'cached_dataset:     {len(train_paths)} shard paths (pass all to --cached_dataset)')
+        if val_paths:
+            print(f'cached_val_dataset: {len(val_paths)} shard paths (pass all to --cached_val_dataset)')
+        print('\nExample training command:')
+        print(
+            '  --cached_dataset \\\n    ' +
+            ' \\\n    '.join(train_paths[:3]) +
+            (' ...' if len(train_paths) > 3 else ''))
+    else:
+        # ---- legacy single-pass mode ----
+        train_dir = os.path.join(args.output_dir, 'train')
+        val_dir = os.path.join(args.output_dir, 'val')
+        # Re-use _encode_and_save by pointing out_dir at a sibling that wraps
+        # both train/ and val/. That keeps atomicity semantics the same.
+        wrap_dir = os.path.join(args.output_dir, '_single')
+        if os.path.exists(wrap_dir):
+            shutil.rmtree(wrap_dir)
+        tn, vn = _encode_and_save(dataset, wrap_dir, desc='Encoding')
+        # Flatten into final train_dir / val_dir layout (compat with existing
+        # downstream code that expects {output_dir}/train and /val).
+        if os.path.exists(train_dir):
+            shutil.rmtree(train_dir)
+        os.rename(os.path.join(wrap_dir, 'train'), train_dir)
+        if os.path.exists(os.path.join(wrap_dir, 'val')):
+            if os.path.exists(val_dir):
+                shutil.rmtree(val_dir)
+            os.rename(os.path.join(wrap_dir, 'val'), val_dir)
+        shutil.rmtree(wrap_dir)
+
+        print(f'cached_dataset: `{train_dir}` ({tn} samples)')
+        if vn:
+            print(f'cached_val_dataset: `{val_dir}` ({vn} samples)')
+
+        meta = {
+            'full_encode': True,
+            'packing': False,
+            'model': args.model,
+            'source_dataset': args.source_dataset,
+            'image_root': args.image_root,
+        }
+        meta_path = os.path.join(args.output_dir, 'cache_meta.json')
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        print(f'cache metadata: `{meta_path}`')
 
 
 if __name__ == '__main__':

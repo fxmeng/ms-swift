@@ -29,6 +29,18 @@
 #
 # OMP_NUM_THREADS=1 is important: each of the N map workers otherwise forks
 # its own BLAS thread pool, which produces huge context-switch overhead.
+# Shard mode (recommended for multi-hour runs):
+#   --shard_rows N  slices the source dataset into chunks of N rows and writes
+#                   each chunk as a self-contained HF dataset under
+#                   {output_dir}/shards/shard-XXXXXX-of-YYYYYY/{train,val}/.
+#                   Each shard is materialized via a .tmp → rename atomic
+#                   handoff, so a crash leaves at most one uncommitted .tmp
+#                   sibling, never a half-finished shard. Re-running the same
+#                   command skips shards that already exist and continues from
+#                   the first missing one — true resume-from-crash.
+#
+#   Typical shard_rows: 200k-500k. Larger amortizes map setup cost; smaller
+#   keeps the redo-cost after a crash bounded.
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 python examples/train/cached_dataset/encode_pretrain_vl.py \
@@ -36,34 +48,57 @@ python examples/train/cached_dataset/encode_pretrain_vl.py \
     --source_dataset /path/to/your/hf_save_to_disk_dir \
     --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
     --output_dir ./qwen3_vl_pretrain_cached \
-    --num_proc 32 \
+    --num_proc 128 \
     --batch_size 16 \
     --io_threads 4 \
     --writer_batch_size 256 \
     --max_pixels 1310720 \
     --min_pixels 4096 \
+    --max_shard_size 2GB \
+    --save_num_proc 16 \
+    --shard_rows 500000 \
     --val_ratio 0.01
 
-# Output after Step 1:
+# Output after Step 1 (shard mode):
 #   qwen3_vl_pretrain_cached/
-#     train/            — Arrow (input_ids, labels, pixel_values_bytes, discrete_tokens, ...)
-#     val/              — Arrow (validation split)
+#     shards/
+#       shard-000000-of-000240/
+#         train/   ← Arrow (input_ids, labels, pixel_values_bytes, discrete_tokens, ...)
+#         val/     ← Arrow (validation split for this shard, if --val_ratio > 0)
+#       shard-000001-of-000240/
+#         ...
+#       ...
 #     cache_meta.json
 
 
-# --- Step 2 (optional): precompute packing groups from cached train set ---
-# This calls the swift export path we extended to support packing-only mode.
-swift export \
-    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
-    --cached_dataset ./qwen3_vl_pretrain_cached/train \
-    --to_cached_dataset true \
-    --full_encode true \
-    --packing true \
-    --max_length 4096 \
-    --output_dir ./qwen3_vl_pretrain_cached/train_packing
+# --- Step 2 (optional): precompute packing groups from cached train shards ---
+# swift export's packing-only mode accepts one cached_dataset per invocation.
+# With shard mode you run it once per shard; in practice, packing precompute
+# is cheap so this is fine to do in a simple shell loop.
+for shard in ./qwen3_vl_pretrain_cached/shards/shard-*; do
+    if [ -d "${shard}/train_packing" ]; then
+        continue
+    fi
+    swift export \
+        --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+        --cached_dataset "${shard}/train" \
+        --to_cached_dataset true \
+        --full_encode true \
+        --packing true \
+        --max_length 4096 \
+        --output_dir "${shard}/train_packing"
+done
 
 
 # --- Step 3: train with pre-cached data (multi-GPU Megatron) ---
+# Shell glob below expands to the per-shard paths. ms-swift's
+# --cached_dataset / --cached_val_dataset / --cached_packing_dataset each
+# accept a list of paths and concatenate them at load time, so no final
+# merge step is required.
+TRAIN_SHARDS=( ./qwen3_vl_pretrain_cached/shards/shard-*/train )
+VAL_SHARDS=(   ./qwen3_vl_pretrain_cached/shards/shard-*/val )
+PACK_SHARDS=(  ./qwen3_vl_pretrain_cached/shards/shard-*/train_packing )
+
 # 8 * 80GiB
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 OMP_NUM_THREADS=14 \
@@ -75,9 +110,9 @@ FPS_MAX_FRAMES=16 \
 megatron pt \
     --model Qwen/Qwen3-VL-30B-A3B-Instruct \
     --save_safetensors true \
-    --cached_dataset './qwen3_vl_pretrain_cached/train' \
-    --cached_val_dataset './qwen3_vl_pretrain_cached/val' \
-    --cached_packing_dataset './qwen3_vl_pretrain_cached/train_packing' \
+    --cached_dataset         "${TRAIN_SHARDS[@]}" \
+    --cached_val_dataset     "${VAL_SHARDS[@]}" \
+    --cached_packing_dataset "${PACK_SHARDS[@]}" \
     --load_from_cache_file true \
     --moe_permute_fusion true \
     --tensor_model_parallel_size 2 \
