@@ -54,9 +54,36 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-import torch
-from datasets import Features, Sequence, Value, load_from_disk
-from PIL import Image
+# Pin thread counts BEFORE importing torch / numpy / datasets so that child
+# workers forked by datasets.map inherit a single-threaded BLAS/OMP config.
+# Without this, each of the N map workers spawns its own BLAS + torch intraop
+# pool (typically one thread per physical core), blowing load average to N*cores.
+for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+             'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_var, '1')
+
+import torch  # noqa: E402
+import warnings  # noqa: E402
+from datasets import Features, Sequence, Value, load_from_disk  # noqa: E402
+from PIL import Image  # noqa: E402
+
+# Silence PIL noise about palette-mode PNGs with transparency. We handle those
+# images correctly below via _load_rgb_image (RGBA-composite onto white).
+# Without this, tqdm gets drowned out when num_proc is large.
+warnings.filterwarnings(
+    'ignore',
+    message='Palette images with Transparency.*',
+    category=UserWarning,
+)
+
+# torch has its own intra-op / inter-op thread pools independent of OMP.
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # set_num_interop_threads must be called before any parallel work; if
+    # something else already fired it up we silently skip.
+    pass
 
 VISION_START_ID = 151652
 VISION_END_ID = 151653
@@ -188,9 +215,31 @@ def _assemble_row(
     return result
 
 
+def _load_rgb_image(path: str) -> Image.Image:
+    """Open an image and return an RGB copy.
+
+    Handles palette-mode PNGs with transparency (common for rendered diagrams
+    such as molecule structures): converts via RGBA then composites onto a
+    white background. A plain ``.convert('RGB')`` on such images fills the
+    transparent region with an arbitrary palette color, which silently shifts
+    the background distribution away from "white" and emits a PIL warning per
+    image.
+    """
+    img = Image.open(path)
+    mode = img.mode
+    if mode == 'RGB':
+        return img
+    if mode == 'RGBA' or (mode == 'P' and 'transparency' in img.info):
+        rgba = img.convert('RGBA')
+        bg = Image.new('RGB', rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        return bg
+    return img.convert('RGB')
+
+
 def _load_pil(path: str, image_root: str) -> Optional[Image.Image]:
     try:
-        return Image.open(os.path.join(image_root, path)).convert('RGB')
+        return _load_rgb_image(os.path.join(image_root, path))
     except Exception:
         return None
 
@@ -346,6 +395,15 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--strict', action='store_true',
                         help='Raise on any per-row failure instead of skipping it.')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Debug knob: only process the first N source rows (after --offset). '
+                             'Useful for smoke-testing pipeline + parameters on a small subset '
+                             'before committing to a multi-hour full run.')
+    parser.add_argument('--offset', type=int, default=0,
+                        help='Debug knob: skip the first N source rows before applying --limit.')
+    parser.add_argument('--shuffle_subset', action='store_true',
+                        help='Debug knob: shuffle the subset selected by --offset/--limit, so '
+                             'you see a random sample instead of only the first rows.')
     args = parser.parse_args()
 
     if args.max_pixels is not None:
@@ -355,6 +413,24 @@ def main():
     _get_processor(args.model)
 
     dataset = load_from_disk(args.source_dataset)
+    total_rows = len(dataset)
+
+    if args.offset or args.limit is not None:
+        start = max(0, args.offset)
+        end = total_rows if args.limit is None else min(total_rows, start + args.limit)
+        if start >= end:
+            raise ValueError(
+                f'offset={args.offset} / limit={args.limit} selects an empty range '
+                f'from a dataset of {total_rows} rows.')
+        if args.shuffle_subset:
+            # Shuffle first so --limit can give a representative random subset
+            # (e.g. for estimating cache size or catching edge cases), then
+            # take the slice.
+            dataset = dataset.shuffle(seed=args.seed).select(range(start, end))
+        else:
+            dataset = dataset.select(range(start, end))
+        print(f'[subset] using rows [{start}, {end}) of {total_rows} '
+              f'({end - start} rows, shuffle={args.shuffle_subset})')
 
     strict = args.strict
     model_id = args.model
