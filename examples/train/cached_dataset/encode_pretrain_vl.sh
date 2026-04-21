@@ -44,7 +44,7 @@
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 python examples/train/cached_dataset/encode_pretrain_vl.py \
-    --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \ \
+    --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \
     --source_dataset /dataspace/0314_vl_datasets_3in1_tokens_4k_shuffled/ \
     --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
     --output_dir /dataspace/qwen3_vl_cached \
@@ -73,12 +73,26 @@ python examples/train/cached_dataset/encode_pretrain_vl.py \
 
 # --- Step 2 (optional): precompute packing groups from cached train shards ---
 # swift export's packing-only mode accepts one cached_dataset per invocation.
-# With shard mode you run it once per shard; in practice, packing precompute
-# is cheap so this is fine to do in a simple shell loop.
-for shard in /dataspace/qwen3_vl_cached/shards/*; do
-    if [ -d "${shard}/train" ]; then
+# With shard mode you run it once per shard; packing precompute is cheap so
+# a simple shell loop is fine.
+#
+# nullglob makes the loop silently do nothing when Step 1 hasn't produced any
+# shards yet (otherwise bash leaves the literal `*` in the pattern and swift
+# export gets called with a path that contains `*`).
+shopt -s nullglob
+for shard in /dataspace/qwen3_vl_cached/shards/shard-*; do
+    # Skip shards that have already been packed in a previous run.
+    if [ -d "${shard}/train_packing" ]; then
+        echo "[pack] skip already-packed: ${shard}"
         continue
     fi
+    # Also skip if this shard's train/ doesn't exist yet (e.g. a .tmp half-
+    # written shard left over from a crash). Step 1 will regenerate it next run.
+    if [ ! -d "${shard}/train" ]; then
+        echo "[pack] skip (no train/): ${shard}"
+        continue
+    fi
+    echo "[pack] packing ${shard}"
     swift export \
         --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \
         --cached_dataset "${shard}/train" \
@@ -88,6 +102,7 @@ for shard in /dataspace/qwen3_vl_cached/shards/*; do
         --max_length 4096 \
         --output_dir "${shard}/train_packing"
 done
+shopt -u nullglob
 
 
 # --- Step 3: train with pre-cached data (multi-GPU Megatron) ---
@@ -95,9 +110,23 @@ done
 # --cached_dataset / --cached_val_dataset / --cached_packing_dataset each
 # accept a list of paths and concatenate them at load time, so no final
 # merge step is required.
+#
+# Use `shard-*` (not `*`) so leftover `.tmp` dirs from a prior crash are
+# excluded. nullglob makes unmatched patterns expand to nothing, so VAL_SHARDS
+# being empty (if --val_ratio=0) is fine.
+shopt -s nullglob
 TRAIN_SHARDS=( /dataspace/qwen3_vl_cached/shards/shard-*/train )
 VAL_SHARDS=(   /dataspace/qwen3_vl_cached/shards/shard-*/val )
 PACK_SHARDS=(  /dataspace/qwen3_vl_cached/shards/shard-*/train_packing )
+shopt -u nullglob
+
+echo "TRAIN_SHARDS: ${#TRAIN_SHARDS[@]}"
+echo "VAL_SHARDS:   ${#VAL_SHARDS[@]}"
+echo "PACK_SHARDS:  ${#PACK_SHARDS[@]}"
+if [ "${#TRAIN_SHARDS[@]}" -eq 0 ]; then
+    echo "ERROR: no train shards found. Did Step 1 finish?"
+    exit 1
+fi
 
 # 8 * 80GiB
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
