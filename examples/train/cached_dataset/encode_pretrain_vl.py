@@ -79,13 +79,21 @@ OUTPUT_FEATURES = Features({
 })
 
 _PROCESSOR_CACHE: Dict[str, Any] = {}
+# Populated once in main() and inherited by forked workers. Avoids passing
+# these through every map() call.
+_PROCESSOR_KWARGS: Dict[str, Any] = {}
 
 
 def _get_processor(model_id: str):
     """Lazily load the image processor per worker process."""
     if model_id not in _PROCESSOR_CACHE:
         from transformers import AutoProcessor
-        _PROCESSOR_CACHE[model_id] = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, **_PROCESSOR_KWARGS)
+        # Also set on image_processor instance so any __call__ path picks them up.
+        for k, v in _PROCESSOR_KWARGS.items():
+            if hasattr(processor.image_processor, k):
+                setattr(processor.image_processor, k, v)
+        _PROCESSOR_CACHE[model_id] = processor
     return _PROCESSOR_CACHE[model_id]
 
 
@@ -315,17 +323,24 @@ def main():
                         help='Directory that all `images` entries are relative to.')
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--num_proc', type=int, default=32,
-                        help='Number of worker processes for datasets.map. '
-                             'On network-mounted image storage, going too high (e.g. 128+) '
-                             'often regresses throughput due to storage / IPC contention.')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='datasets.map(batched=True) batch size. Larger batches amortize '
-                             'per-batch overhead but keep more pixel tensors in memory.')
-    parser.add_argument('--io_threads', type=int, default=8,
-                        help='PIL image loading threads per worker process. These overlap disk '
-                             'I/O with CPU-bound image-processor work inside each batch.')
+                        help='Number of worker processes for datasets.map. Usually physical '
+                             'CPU cores, or slightly less. Going past that wastes on scheduling.')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='datasets.map(batched=True) batch size. Smaller batches give more '
+                             'even load-balancing across workers when some rows have many images.')
+    parser.add_argument('--io_threads', type=int, default=4,
+                        help='PIL image loading threads per worker process. Keep small (2-4) '
+                             'when the job is CPU-bound (top shows 0%% iowait), larger (8-16) '
+                             'only if images live on high-latency storage.')
     parser.add_argument('--writer_batch_size', type=int, default=256,
                         help='datasets.map writer_batch_size; larger reduces arrow write overhead.')
+    parser.add_argument('--max_pixels', type=int, default=None,
+                        help='Cap image_processor resolution (e.g. 1048576 = 1024*1024). '
+                             'This is the single biggest CPU-time knob: it limits the number '
+                             'of patches per image, which directly drives resize + patch-flatten '
+                             'cost and output pixel_values size.')
+    parser.add_argument('--min_pixels', type=int, default=None,
+                        help='Floor image_processor resolution (e.g. 65536 = 256*256).')
     parser.add_argument('--val_ratio', type=float, default=0.0,
                         help='If > 0, randomly hold out this ratio into {output_dir}/val.')
     parser.add_argument('--seed', type=int, default=42)
@@ -333,6 +348,10 @@ def main():
                         help='Raise on any per-row failure instead of skipping it.')
     args = parser.parse_args()
 
+    if args.max_pixels is not None:
+        _PROCESSOR_KWARGS['max_pixels'] = args.max_pixels
+    if args.min_pixels is not None:
+        _PROCESSOR_KWARGS['min_pixels'] = args.min_pixels
     _get_processor(args.model)
 
     dataset = load_from_disk(args.source_dataset)

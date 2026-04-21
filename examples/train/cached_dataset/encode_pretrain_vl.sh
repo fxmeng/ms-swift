@@ -14,23 +14,34 @@
 # `dataset.save_to_disk(...)`; we load it here with `load_from_disk`.
 
 # --- Step 1: encode source dataset into full_encode cache ---
-# Tuning tips (image storage is almost always the bottleneck, not CPU):
-#   * num_proc ≈ physical CPU cores (32-64 is usually sweet spot). Going to
-#     128+ on network-mounted image storage often regresses throughput because
-#     of FS metadata / IPC contention.
-#   * io_threads controls PIL disk reads per worker; increase if images are
-#     on high-latency storage (e.g. /fsx, s3fs, nfs) so CPU work and disk
-#     reads overlap.
-#   * batch_size / writer_batch_size amortize datasets.map + arrow overhead.
+# Tuning tips — check `top` first to see what the bottleneck actually is:
+#   * %wa > 0 and %us low            → I/O bound → raise --io_threads (8-16).
+#   * %wa ~= 0 and %us ~= 100%       → CPU bound → the image processor is the
+#                                       bottleneck. Cap resolution via
+#                                       --max_pixels (most impactful), keep
+#                                       --io_threads small (2-4), and set
+#                                       OMP_NUM_THREADS=1 so each worker
+#                                       doesn't spawn BLAS threads on top.
+#   * load average >> cores          → too many threads: reduce --num_proc or
+#                                       --io_threads.
+#   * worker CPU% very uneven in top → batch load-imbalance: reduce
+#                                       --batch_size (8-16).
+#
+# OMP_NUM_THREADS=1 is important: each of the N map workers otherwise forks
+# its own BLAS thread pool, which produces huge context-switch overhead.
+OMP_NUM_THREADS=1 \
+MKL_NUM_THREADS=1 \
 python examples/train/cached_dataset/encode_pretrain_vl.py \
     --model Qwen/Qwen3-VL-30B-A3B-Instruct \
     --source_dataset /path/to/your/hf_save_to_disk_dir \
     --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
     --output_dir ./qwen3_vl_pretrain_cached \
     --num_proc 32 \
-    --batch_size 32 \
-    --io_threads 8 \
+    --batch_size 16 \
+    --io_threads 4 \
     --writer_batch_size 256 \
+    --max_pixels 1310720 \
+    --min_pixels 4096 \
     --val_ratio 0.01
 
 # Output after Step 1:
