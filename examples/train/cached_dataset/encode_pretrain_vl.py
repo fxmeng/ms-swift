@@ -179,14 +179,20 @@ def _assemble_row(
         n_pad = int(grid[0] * grid[1] * grid[2]) // merge_len
         discrete = region['discrete']
 
-        image_region = (
+        # input_ids keeps only the text-side vision placeholders:
+        #   <vision_start> <image_pad>*n_pad <vision_end>
+        # The discrete image tokens are NOT embedded into input_ids here;
+        # they live in the separate `discrete_tokens` field so the model
+        # code can route them through its own embedding / aligner path.
+        # labels are -100 for the entire vision region (image supervision
+        # is not text supervision).
+        image_region_in_ids = (
             [VISION_START_ID]
             + [IMAGE_PAD_ID] * n_pad
-            + discrete
             + [VISION_END_ID]
         )
-        new_input_ids.extend(image_region)
-        new_labels.extend([-100] * len(image_region))
+        new_input_ids.extend(image_region_in_ids)
+        new_labels.extend([-100] * len(image_region_in_ids))
         discrete_tokens_list.append(discrete)
 
         cursor = region['end'] + 1

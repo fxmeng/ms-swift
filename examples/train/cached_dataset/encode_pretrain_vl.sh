@@ -44,10 +44,10 @@
 OMP_NUM_THREADS=1 \
 MKL_NUM_THREADS=1 \
 python examples/train/cached_dataset/encode_pretrain_vl.py \
-    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
-    --source_dataset /path/to/your/hf_save_to_disk_dir \
+    --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \ \
+    --source_dataset /dataspace/0314_vl_datasets_3in1_tokens_4k_shuffled/ \
     --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
-    --output_dir ./qwen3_vl_pretrain_cached \
+    --output_dir /dataspace/qwen3_vl_cached \
     --num_proc 128 \
     --batch_size 16 \
     --io_threads 4 \
@@ -75,12 +75,12 @@ python examples/train/cached_dataset/encode_pretrain_vl.py \
 # swift export's packing-only mode accepts one cached_dataset per invocation.
 # With shard mode you run it once per shard; in practice, packing precompute
 # is cheap so this is fine to do in a simple shell loop.
-for shard in ./qwen3_vl_pretrain_cached/shards/shard-*; do
-    if [ -d "${shard}/train_packing" ]; then
+for shard in /dataspace/qwen3_vl_cached/shards/*; do
+    if [ -d "${shard}/train" ]; then
         continue
     fi
     swift export \
-        --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+        --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \
         --cached_dataset "${shard}/train" \
         --to_cached_dataset true \
         --full_encode true \
@@ -95,9 +95,9 @@ done
 # --cached_dataset / --cached_val_dataset / --cached_packing_dataset each
 # accept a list of paths and concatenate them at load time, so no final
 # merge step is required.
-TRAIN_SHARDS=( ./qwen3_vl_pretrain_cached/shards/shard-*/train )
-VAL_SHARDS=(   ./qwen3_vl_pretrain_cached/shards/shard-*/val )
-PACK_SHARDS=(  ./qwen3_vl_pretrain_cached/shards/shard-*/train_packing )
+TRAIN_SHARDS=( /dataspace/qwen3_vl_cached/shards/shard-*/train )
+VAL_SHARDS=(   /dataspace/qwen3_vl_cached/shards/shard-*/val )
+PACK_SHARDS=(  /dataspace/qwen3_vl_cached/shards/shard-*/train_packing )
 
 # 8 * 80GiB
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
