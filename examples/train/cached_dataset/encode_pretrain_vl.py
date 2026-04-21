@@ -392,6 +392,13 @@ def main():
                         help='Floor image_processor resolution (e.g. 65536 = 256*256).')
     parser.add_argument('--val_ratio', type=float, default=0.0,
                         help='If > 0, randomly hold out this ratio into {output_dir}/val.')
+    parser.add_argument('--max_shard_size', type=str, default='2GB',
+                        help='save_to_disk shard size (default datasets value is 500MB). Larger '
+                             'shards mean fewer arrow files, which matters for multi-TB caches '
+                             'where the default produces tens of thousands of small files.')
+    parser.add_argument('--save_num_proc', type=int, default=16,
+                        help='Parallelism for save_to_disk (default datasets value is 1). Using '
+                             'multiple workers dramatically speeds up writing a large cache.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--strict', action='store_true',
                         help='Raise on any per-row failure instead of skipping it.')
@@ -455,14 +462,20 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     train_dir = os.path.join(args.output_dir, 'train')
     val_dir = os.path.join(args.output_dir, 'val')
+    save_kwargs = {
+        'max_shard_size': args.max_shard_size,
+        'num_proc': args.save_num_proc,
+    }
     if args.val_ratio and args.val_ratio > 0:
         split = dataset.train_test_split(test_size=args.val_ratio, seed=args.seed, shuffle=True)
-        split['train'].save_to_disk(train_dir)
-        split['test'].save_to_disk(val_dir)
+        split['train'].save_to_disk(train_dir, **save_kwargs)
+        # Val set is tiny — no need to parallelize, and multi-proc save has
+        # per-worker startup cost that dominates for small outputs.
+        split['test'].save_to_disk(val_dir, max_shard_size=args.max_shard_size)
         print(f'cached_dataset:     `{train_dir}` ({len(split["train"])} samples)')
         print(f'cached_val_dataset: `{val_dir}` ({len(split["test"])} samples)')
     else:
-        dataset.save_to_disk(train_dir)
+        dataset.save_to_disk(train_dir, **save_kwargs)
         print(f'cached_dataset: `{train_dir}` ({len(dataset)} samples)')
 
     meta = {
