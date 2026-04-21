@@ -51,6 +51,7 @@ Example:
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -118,39 +119,13 @@ def _parse_image_regions(input_ids: List[int]) -> List[Dict[str, Any]]:
     return regions
 
 
-def _build_sample(row: Dict[str, Any], model_id: str, image_root: str) -> Optional[Dict[str, Any]]:
-    processor = _get_processor(model_id)
-    merge_size = int(getattr(processor.image_processor, 'merge_size', 2))
-    merge_len = merge_size * merge_size
-
-    orig_input_ids = list(row['input_ids'])
-    images = row.get('images') or []
-    if isinstance(images, str):
-        images = [images]
-
-    regions = _parse_image_regions(orig_input_ids)
-    if len(regions) != len(images):
-        raise ValueError(
-            f'Number of image regions ({len(regions)}) does not match '
-            f'number of image paths ({len(images)}).')
-
-    if images:
-        pil_images = [Image.open(os.path.join(image_root, p)).convert('RGB') for p in images]
-        image_inputs = processor.image_processor(images=pil_images, return_tensors='pt')
-        pixel_values = image_inputs['pixel_values']          # [sum_i t_i*h_i*w_i, patch_dim]
-        image_grid_thw = image_inputs['image_grid_thw']      # Long [num_images, 3]
-        # Guard against the processor silently dropping an image (e.g. decode
-        # failure). Multi-image rows must preserve exact 1:1 correspondence
-        # between `images[i]`, `regions[i]` and `image_grid_thw[i]`.
-        if image_grid_thw.shape[0] != len(regions):
-            raise ValueError(
-                f'image_processor returned {image_grid_thw.shape[0]} grids but '
-                f'input_ids has {len(regions)} image regions and row has '
-                f'{len(images)} image paths.')
-    else:
-        pixel_values = None
-        image_grid_thw = None
-
+def _assemble_row(
+    orig_input_ids: List[int],
+    regions: List[Dict[str, Any]],
+    pixel_values: Optional[torch.Tensor],
+    image_grid_thw: Optional[torch.Tensor],
+    merge_len: int,
+) -> Dict[str, Any]:
     new_input_ids: List[int] = []
     new_labels: List[int] = []
     discrete_tokens_list: List[List[int]] = []
@@ -205,16 +180,129 @@ def _build_sample(row: Dict[str, Any], model_id: str, image_root: str) -> Option
     return result
 
 
-_OUTPUT_COLUMNS = [
-    'input_ids', 'labels', 'lengths', 'loss_scale', 'discrete_tokens',
-    'pixel_values_bytes', 'pixel_values_shape',
-    'pixel_values_videos_bytes', 'pixel_values_videos_shape',
-    'image_grid_thw', 'video_grid_thw',
-]
+def _load_pil(path: str, image_root: str) -> Optional[Image.Image]:
+    try:
+        return Image.open(os.path.join(image_root, path)).convert('RGB')
+    except Exception:
+        return None
 
 
-def _none_row() -> Dict[str, Any]:
-    return {k: None for k in _OUTPUT_COLUMNS}
+def _build_batch(
+    batch: Dict[str, List[Any]],
+    model_id: str,
+    image_root: str,
+    strict: bool,
+    io_threads: int,
+) -> Dict[str, List[Any]]:
+    """Process a batch of rows.
+
+    Optimizations vs. per-row processing:
+      * ``datasets.map(batched=True)`` amortizes map/pickle/arrow overhead
+        across ``batch_size`` rows.
+      * A ThreadPoolExecutor overlaps image disk I/O (I/O bound, releases the
+        GIL during disk read) with image-processor CPU work. This is the main
+        speedup on network-mounted image storage (e.g. /fsx).
+    """
+    processor = _get_processor(model_id)
+    merge_size = int(getattr(processor.image_processor, 'merge_size', 2))
+    merge_len = merge_size * merge_size
+
+    n = len(batch['input_ids'])
+
+    # Pass 1: parse regions per row.
+    plans: List[Optional[Dict[str, Any]]] = []
+    for i in range(n):
+        try:
+            orig_input_ids = list(batch['input_ids'][i])
+            images = batch['images'][i] or []
+            if isinstance(images, str):
+                images = [images]
+            regions = _parse_image_regions(orig_input_ids)
+            if len(regions) != len(images):
+                raise ValueError(
+                    f'Number of image regions ({len(regions)}) does not match '
+                    f'number of image paths ({len(images)}).')
+            plans.append({'input_ids': orig_input_ids, 'regions': regions, 'images': images})
+        except Exception:
+            if strict:
+                raise
+            plans.append(None)
+
+    # Pass 2: flat (row_idx, img_idx, path) list, then parallel PIL load.
+    flat: List = []
+    for row_idx, plan in enumerate(plans):
+        if plan is None:
+            continue
+        for j, path in enumerate(plan['images']):
+            flat.append((row_idx, j, path))
+
+    pil_by_row: Dict[int, List[Image.Image]] = {}
+    if flat:
+        max_workers = max(1, min(io_threads, len(flat)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            loaded = list(ex.map(lambda item: (item[0], item[1], _load_pil(item[2], image_root)), flat))
+
+        failed_rows = set()
+        for row_idx, _j, img in loaded:
+            if img is None:
+                failed_rows.add(row_idx)
+                continue
+            pil_by_row.setdefault(row_idx, []).append(img)
+
+        for row_idx in failed_rows:
+            if strict:
+                raise RuntimeError(f'Failed to load one or more images for row {row_idx}.')
+            plans[row_idx] = None
+        # Also drop rows where image count mismatched after load.
+        for row_idx, plan in enumerate(plans):
+            if plan is None:
+                continue
+            if len(pil_by_row.get(row_idx, [])) != len(plan['images']):
+                if strict:
+                    raise RuntimeError(f'PIL load count mismatch for row {row_idx}.')
+                plans[row_idx] = None
+
+    # Pass 3: per-row image-processor call + output assembly.
+    # Keeping the processor call per-row (instead of stacking a mega-batch) is
+    # intentional:
+    #   * Qwen2VL image processor iterates images internally anyway.
+    #   * Per-row calls keep exception handling simple and let us mark one
+    #     failing row ``None`` without affecting the rest of the batch.
+    out: Dict[str, List[Any]] = {k: [] for k in OUTPUT_FEATURES}
+
+    def _append_none():
+        for k in out:
+            out[k].append(None)
+
+    for row_idx in range(n):
+        plan = plans[row_idx]
+        if plan is None:
+            _append_none()
+            continue
+        try:
+            pil_images = pil_by_row.get(row_idx, [])
+            if pil_images:
+                image_inputs = processor.image_processor(images=pil_images, return_tensors='pt')
+                pixel_values = image_inputs['pixel_values']
+                image_grid_thw = image_inputs['image_grid_thw']
+                if image_grid_thw.shape[0] != len(plan['regions']):
+                    raise ValueError(
+                        f'image_processor returned {image_grid_thw.shape[0]} grids but '
+                        f'row has {len(plan["regions"])} image regions.')
+            else:
+                pixel_values = None
+                image_grid_thw = None
+
+            row_out = _assemble_row(
+                plan['input_ids'], plan['regions'], pixel_values, image_grid_thw, merge_len)
+            for k in out:
+                out[k].append(row_out[k])
+        except Exception:
+            if strict:
+                raise
+            _append_none()
+
+    return out
 
 
 def main():
@@ -226,7 +314,18 @@ def main():
     parser.add_argument('--image_root', required=True,
                         help='Directory that all `images` entries are relative to.')
     parser.add_argument('--output_dir', required=True)
-    parser.add_argument('--num_proc', type=int, default=8)
+    parser.add_argument('--num_proc', type=int, default=32,
+                        help='Number of worker processes for datasets.map. '
+                             'On network-mounted image storage, going too high (e.g. 128+) '
+                             'often regresses throughput due to storage / IPC contention.')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='datasets.map(batched=True) batch size. Larger batches amortize '
+                             'per-batch overhead but keep more pixel tensors in memory.')
+    parser.add_argument('--io_threads', type=int, default=8,
+                        help='PIL image loading threads per worker process. These overlap disk '
+                             'I/O with CPU-bound image-processor work inside each batch.')
+    parser.add_argument('--writer_batch_size', type=int, default=256,
+                        help='datasets.map writer_batch_size; larger reduces arrow write overhead.')
     parser.add_argument('--val_ratio', type=float, default=0.0,
                         help='If > 0, randomly hold out this ratio into {output_dir}/val.')
     parser.add_argument('--seed', type=int, default=42)
@@ -241,21 +340,19 @@ def main():
     strict = args.strict
     model_id = args.model
     image_root = args.image_root
+    io_threads = args.io_threads
 
-    def _map_fn(row):
-        try:
-            out = _build_sample(row, model_id, image_root)
-            return out if out is not None else _none_row()
-        except Exception:
-            if strict:
-                raise
-            return _none_row()
+    def _map_fn(batch):
+        return _build_batch(batch, model_id, image_root, strict, io_threads)
 
     dataset = dataset.map(
         _map_fn,
+        batched=True,
+        batch_size=args.batch_size,
         num_proc=args.num_proc,
         remove_columns=dataset.column_names,
         features=OUTPUT_FEATURES,
+        writer_batch_size=args.writer_batch_size,
         desc='Encoding',
     )
     dataset = dataset.filter(lambda r: r['input_ids'] is not None, num_proc=args.num_proc)
