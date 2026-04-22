@@ -1,11 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import json
 import numpy as np
 import os
 import tempfile
 import torch
 from datasets import Dataset as HfDataset
+from io import BytesIO
 from modelscope.hub.utils.utils import get_cache_dir
+from PIL import Image
 from torch.utils.data import Dataset
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -14,6 +17,61 @@ from swift.utils import get_logger
 from .preprocessor import RowPreprocessor
 
 logger = get_logger()
+
+
+def _decode_rgb_image_from_bytes(raw_bytes: bytes) -> Image.Image:
+    """Decode raw image bytes into an RGB PIL image.
+
+    MUST stay bit-equivalent to ``examples/train/cached_dataset/encode_pretrain_vl.py``'s
+    ``_decode_rgb_image``: both sides of the cache pipeline use this to convert
+    raw bytes into the RGB PIL image that the image_processor consumes. The
+    palette+transparency branch composites onto a white background instead of
+    PIL's default (transparent → arbitrary palette color), which is the exact
+    conversion done at encode time.
+    """
+    img = Image.open(BytesIO(raw_bytes))
+    mode = img.mode
+    if mode == 'RGB':
+        img.load()
+        return img
+    if mode == 'RGBA' or (mode == 'P' and 'transparency' in img.info):
+        rgba = img.convert('RGBA')
+        bg = Image.new('RGB', rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        return bg
+    return img.convert('RGB')
+
+
+def _find_cache_meta(cache_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Locate cache_meta.json for a given Arrow-dataset path.
+
+    Looks in the dataset dir itself first, then walks up two parents. This
+    matches how encode_pretrain_vl.py drops meta files:
+
+        {output_dir}/cache_meta.json                     (cache root)
+        {output_dir}/shards/shard-.../cache_meta.json    (per-shard)
+        {output_dir}/shards/shard-.../{train,val}/       (actual Arrow dirs)
+    """
+    if not cache_path:
+        return None
+    candidates: List[str] = []
+    p = os.path.abspath(cache_path.rstrip('/'))
+    candidates.append(os.path.join(p, 'cache_meta.json'))
+    parent = os.path.dirname(p)
+    if parent:
+        candidates.append(os.path.join(parent, 'cache_meta.json'))
+    gparent = os.path.dirname(parent) if parent else ''
+    if gparent:
+        candidates.append(os.path.join(gparent, 'cache_meta.json'))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            try:
+                with open(candidate) as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f'failed to read {candidate}: {e}')
+                return None
+    return None
 
 
 def sample_dataset(
@@ -177,13 +235,78 @@ class FullEncodePreprocessor(EncodePreprocessor):
 
 
 class CachedEncodedDataset(Dataset):
-    """Wraps a fully-encoded Arrow dataset, reconstructing tensors from bytes on access."""
+    """Wraps a fully-encoded Arrow dataset, reconstructing tensors on access.
 
-    def __init__(self, arrow_dataset: HfDataset):
+    Two storage modes are supported transparently, picked per-row at read
+    time based on which column is populated:
+
+      pixel_values mode (legacy)
+        Row has ``pixel_values_bytes`` + ``pixel_values_shape`` → rebuild
+        the fp16 tensor via ``np.frombuffer``. Zero image-processor work at
+        training time.
+
+      image_bytes mode (cache_meta.store_mode == 'image_bytes')
+        Row has ``image_bytes`` (list of raw JPEG/PNG bytes). Training runs
+        the image_processor on demand to reproduce ``pixel_values`` with
+        the same ``max_pixels`` / ``min_pixels`` used at encode time (read
+        from the sibling ``cache_meta.json``). The ``image_grid_thw`` is
+        still read verbatim from the cache (authoritative; computed at
+        encode time) so ``n_pad`` in ``input_ids`` always matches the
+        tensor shape.
+
+    Training-side per-batch outputs are bit-identical between the two modes
+    given the same source data and the same ``max_pixels`` / ``min_pixels``.
+    The trade-off is storage (image_bytes ~20-50x smaller) vs. per-batch
+    CPU cost (pixel_values has none; image_bytes runs image_processor).
+    """
+
+    def __init__(self, arrow_dataset: HfDataset, cache_path: Optional[str] = None):
         self.dataset = arrow_dataset
+        self.cache_path = cache_path
+        self._meta = _find_cache_meta(cache_path) or {}
+        self._store_mode = self._meta.get('store_mode') or 'pixel_values'
+        self._has_image_bytes_col = 'image_bytes' in arrow_dataset.column_names
+        if self._has_image_bytes_col and not self._meta:
+            # A cache built in image_bytes mode without a discoverable
+            # cache_meta.json is unusable: we won't know which model's
+            # image_processor to load, nor max/min_pixels. Fail early.
+            logger.warning(
+                f"cached_dataset at `{cache_path}` has an `image_bytes` column but no "
+                f"cache_meta.json was found; image processing will be attempted with default "
+                f"image_processor settings and may produce DIFFERENT pixel_values from what "
+                f"the encode step used. Rebuild the cache or drop a cache_meta.json next to it.")
+        # image_processor is loaded lazily, per-worker, on first image_bytes
+        # row. This matters because dataloader workers are forked and we
+        # don't want to pay the load cost in the parent.
+        self._image_processor = None
 
     def __len__(self) -> int:
         return len(self.dataset)
+
+    def _get_image_processor(self):
+        if self._image_processor is not None:
+            return self._image_processor
+        from transformers import AutoProcessor
+        model_path = self._meta.get('model')
+        if not model_path:
+            raise RuntimeError(
+                f"cached_dataset at `{self.cache_path}` is in image_bytes mode but "
+                f"cache_meta.json doesn't record the model path. Cannot load image_processor.")
+        processor_kwargs = {}
+        for k in ('max_pixels', 'min_pixels'):
+            v = self._meta.get(k)
+            if v is not None:
+                processor_kwargs[k] = v
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, **processor_kwargs)
+        # Also set on the image_processor instance directly so any internal
+        # call paths that read these attributes pick them up (mirrors what
+        # encode_pretrain_vl.py does in _get_processor).
+        for k, v in processor_kwargs.items():
+            if hasattr(processor.image_processor, k):
+                setattr(processor.image_processor, k, v)
+        self._image_processor = processor.image_processor
+        return self._image_processor
 
     def __getitem__(self, idx):
         if isinstance(idx, str):
@@ -197,13 +320,39 @@ class CachedEncodedDataset(Dataset):
         if 'loss_scale' in row and row['loss_scale'] is not None:
             result['loss_scale'] = row['loss_scale']
 
-        if row.get('pixel_values_bytes') is not None:
+        # ---- images ----
+        # Prefer new image_bytes path; fall back to legacy pixel_values_bytes.
+        img_bytes_list = row.get('image_bytes') if self._has_image_bytes_col else None
+        if img_bytes_list:
+            pil_images = [_decode_rgb_image_from_bytes(b) for b in img_bytes_list if b is not None]
+            if pil_images:
+                processor = self._get_image_processor()
+                image_inputs = processor(images=pil_images, return_tensors='pt')
+                # fp16 cast here matches what pixel_values mode stored on disk,
+                # so downstream code (collator + model forward) sees the same
+                # dtype regardless of storage mode.
+                result['pixel_values'] = image_inputs['pixel_values'].to(torch.float16)
+                # Trust encode-time image_grid_thw over what we just recomputed:
+                # it's the authoritative value that n_pad in input_ids was
+                # derived from. In the normal case they match; if the user
+                # changed max/min_pixels between encode and train, taking the
+                # stored value keeps n_pad / pixel_values consistent.
+                if row.get('image_grid_thw') is not None:
+                    result['image_grid_thw'] = torch.tensor(row['image_grid_thw'])
+                else:
+                    result['image_grid_thw'] = image_inputs['image_grid_thw']
+        elif row.get('pixel_values_bytes') is not None:
             shape = row['pixel_values_shape']
             arr = np.frombuffer(row['pixel_values_bytes'], dtype=np.float16).reshape(shape)
             result['pixel_values'] = torch.from_numpy(arr.copy())
-        if row.get('image_grid_thw') is not None:
+            if row.get('image_grid_thw') is not None:
+                result['image_grid_thw'] = torch.tensor(row['image_grid_thw'])
+        elif row.get('image_grid_thw') is not None:
+            # Grid present but no image data: unusual, but preserve it so
+            # the model doesn't crash on missing pixel_values for images.
             result['image_grid_thw'] = torch.tensor(row['image_grid_thw'])
 
+        # ---- videos (unchanged) ----
         if row.get('pixel_values_videos_bytes') is not None:
             shape = row['pixel_values_videos_shape']
             arr = np.frombuffer(row['pixel_values_videos_bytes'], dtype=np.float16).reshape(shape)

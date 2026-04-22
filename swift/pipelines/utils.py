@@ -113,7 +113,7 @@ def get_cached_dataset(args):
                     arrow_dataset = sample_dataset(
                         arrow_dataset, int(dataset_sample), args.dataset_shuffle,
                         random_state=random_state, shuffle_all=True)
-                dataset = CachedEncodedDataset(arrow_dataset)
+                dataset = CachedEncodedDataset(arrow_dataset, cache_path=path)
                 dataset_modified = len(arrow_dataset) != original_len
                 if is_train and getattr(args, 'packing', False):
                     if dataset_modified:

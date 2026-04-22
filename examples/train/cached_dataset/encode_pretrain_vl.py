@@ -20,7 +20,8 @@ Image region layout in the source `input_ids`:
 This script:
   1. Parses every <vision_start> ... <vision_end> region.
   2. Loads each image and runs the Qwen3-VL image processor to get
-     `pixel_values` + `image_grid_thw`.
+     the authoritative ``image_grid_thw`` (and, in ``pixel_values`` mode,
+     the decoded ``pixel_values`` tensor).
   3. Replaces the (possibly-wrong) number of image_pad tokens inside each
      region with the correct count:
          n_pad = image_grid_thw[i].prod() // (merge_size ** 2)
@@ -28,15 +29,41 @@ This script:
   5. Builds labels where image regions (<vision_start>, pads, discretes,
      <vision_end>) are masked with -100 and all text tokens are learned
      (pretraining). No Qwen chat-template prefix is added.
-  6. Writes an Arrow dataset whose schema matches ms-swift's
-     `FullEncodePreprocessor`, so training can load it directly via
-     `--cached_dataset`. A per-row `discrete_tokens` column is added for
-     convenience (list-of-list for multi-image rows).
+  6. Writes an Arrow dataset whose schema is a superset of ms-swift's
+     ``FullEncodePreprocessor`` schema plus an ``image_bytes`` column, so
+     training can load it directly via ``--cached_dataset``.
+
+Storage modes (--store_mode):
+
+  image_bytes   (default; recommended for pretraining-scale corpora)
+      Stores the raw on-disk bytes of each image (JPEG/PNG bytes, typically
+      50-150 KB/image) and the authoritative ``image_grid_thw``. At training
+      time ``CachedEncodedDataset`` re-runs the image_processor with the
+      exact same ``max_pixels`` / ``min_pixels`` recorded in ``cache_meta``,
+      producing bit-identical ``pixel_values`` to the legacy mode. Cache
+      size scales with the compressed source images (~50-150 KB/row) rather
+      than the decoded fp16 tensor (~2-3 MB/row in the legacy mode).
+
+  pixel_values  (legacy; single-pass encode, zero-CPU at training time)
+      Decodes images once, runs image_processor, and serializes the fp16
+      ``pixel_values`` tensor into the cache. Training reads them back with
+      zero image work. Produces 20-50x larger caches than ``image_bytes``
+      because JPEG-compressed bytes get expanded into dense float tensors.
+
+Both modes produce identical ``input_ids`` / ``labels`` / ``image_grid_thw``
+/ ``discrete_tokens`` and identical per-batch tensors at training time. The
+only difference is WHEN the decode+process work happens (encode vs. train).
 
 Output layout:
     {output_dir}/train/            Arrow dataset
     {output_dir}/val/              Arrow dataset (when --val_ratio > 0)
-    {output_dir}/cache_meta.json
+    {output_dir}/cache_meta.json   Root metadata for the whole cache
+    {output_dir}/shards/shard-XXXXXX-of-YYYYYY/
+        cache_meta.json            Per-shard metadata (identical fields);
+                                   makes the shard dir self-describing so
+                                   training can recover image_processor
+                                   settings from any shard path alone.
+        train/ val/
 
 Example:
     python encode_pretrain_vl.py \
@@ -44,6 +71,7 @@ Example:
         --source_dataset /path/to/saved_to_disk_dir \
         --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
         --output_dir ./qwen3_vl_pretrain_cached \
+        --store_mode image_bytes \
         --num_proc 8 \
         --val_ratio 0.01
 """
@@ -67,6 +95,7 @@ for _var in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
 
 import torch  # noqa: E402
 import warnings  # noqa: E402
+from io import BytesIO  # noqa: E402
 from datasets import Features, Sequence, Value, load_from_disk  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -94,19 +123,35 @@ IMAGE_PAD_ID = 151655
 
 # Explicit schema keeps multi-shard / multi-proc map() from breaking when some
 # shards contain only text-only rows (where image fields are all None/empty).
+#
+# `image_bytes` (new) stores raw on-disk JPEG/PNG bytes per image. It coexists
+# with `pixel_values_bytes` (legacy, decoded fp16 tensor) so a cache built in
+# either mode is loadable by the same training code, which picks the mode at
+# runtime based on which column is populated (see swift/dataset/utils.py
+# CachedEncodedDataset).
 OUTPUT_FEATURES = Features({
     'input_ids': Sequence(Value('int32')),
     'labels': Sequence(Value('int32')),
     'lengths': Sequence(Value('int32')),
     'loss_scale': Sequence(Value('float32')),
     'discrete_tokens': Sequence(Sequence(Value('int32'))),
+    # image_bytes mode:
+    'image_bytes': Sequence(Value('binary')),
+    # pixel_values mode (legacy):
     'pixel_values_bytes': Value('binary'),
     'pixel_values_shape': Sequence(Value('int32')),
+    # videos (unused by this script, kept for schema compat):
     'pixel_values_videos_bytes': Value('binary'),
     'pixel_values_videos_shape': Sequence(Value('int32')),
+    # grid_thw shared by both modes:
     'image_grid_thw': Sequence(Sequence(Value('int32'))),
     'video_grid_thw': Sequence(Sequence(Value('int32'))),
 })
+
+# Storage modes.
+STORE_MODE_IMAGE_BYTES = 'image_bytes'
+STORE_MODE_PIXEL_VALUES = 'pixel_values'
+VALID_STORE_MODES = (STORE_MODE_IMAGE_BYTES, STORE_MODE_PIXEL_VALUES)
 
 _PROCESSOR_CACHE: Dict[str, Any] = {}
 # Populated once in main() and inherited by forked workers. Avoids passing
@@ -162,8 +207,26 @@ def _assemble_row(
     regions: List[Dict[str, Any]],
     pixel_values: Optional[torch.Tensor],
     image_grid_thw: Optional[torch.Tensor],
+    raw_image_bytes: Optional[List[bytes]],
     merge_len: int,
+    store_mode: str,
 ) -> Dict[str, Any]:
+    """Build one output row.
+
+    Args:
+        orig_input_ids: source sequence (contains the original vision regions).
+        regions: parsed <vision_start> / <vision_end> spans.
+        pixel_values: image_processor output stacked across regions. Required
+            for ``store_mode == 'pixel_values'``; may be ``None`` in
+            ``image_bytes`` mode (unused there).
+        image_grid_thw: per-image ``(T, H_patches, W_patches)`` tensor,
+            authoritative for n_pad computation. Required whenever there are
+            images.
+        raw_image_bytes: original on-disk bytes per image. Required for
+            ``image_bytes`` mode; unused for ``pixel_values`` mode.
+        merge_len: ``merge_size ** 2``; used to compute n_pad from the grid.
+        store_mode: one of ``VALID_STORE_MODES``.
+    """
     new_input_ids: List[int] = []
     new_labels: List[int] = []
     discrete_tokens_list: List[List[int]] = []
@@ -202,30 +265,44 @@ def _assemble_row(
         new_input_ids.extend(tail)
         new_labels.extend(tail)
 
+    # Base row; fill image-side columns below depending on store_mode.
     result: Dict[str, Any] = {
         'input_ids': new_input_ids,
         'labels': new_labels,
         'lengths': [len(new_input_ids)],
         'loss_scale': None,
         'discrete_tokens': discrete_tokens_list,
+        'image_bytes': None,
+        'pixel_values_bytes': None,
+        'pixel_values_shape': None,
         'pixel_values_videos_bytes': None,
         'pixel_values_videos_shape': None,
+        'image_grid_thw': None,
         'video_grid_thw': None,
     }
-    if pixel_values is not None:
-        t = pixel_values.to(torch.float16).contiguous()
-        result['pixel_values_bytes'] = t.numpy().tobytes()
-        result['pixel_values_shape'] = list(t.shape)
+
+    has_images = image_grid_thw is not None and len(image_grid_thw) > 0
+    if has_images:
         result['image_grid_thw'] = image_grid_thw.tolist()
-    else:
-        result['pixel_values_bytes'] = None
-        result['pixel_values_shape'] = None
-        result['image_grid_thw'] = None
+        if store_mode == STORE_MODE_PIXEL_VALUES:
+            if pixel_values is None:
+                raise ValueError('pixel_values is required in pixel_values store_mode')
+            t = pixel_values.to(torch.float16).contiguous()
+            result['pixel_values_bytes'] = t.numpy().tobytes()
+            result['pixel_values_shape'] = list(t.shape)
+        elif store_mode == STORE_MODE_IMAGE_BYTES:
+            if raw_image_bytes is None or len(raw_image_bytes) != len(regions):
+                raise ValueError(
+                    'raw_image_bytes must be provided for every region in '
+                    'image_bytes store_mode')
+            result['image_bytes'] = list(raw_image_bytes)
+        else:
+            raise ValueError(f'unknown store_mode: {store_mode}')
     return result
 
 
-def _load_rgb_image(path: str) -> Image.Image:
-    """Open an image and return an RGB copy.
+def _decode_rgb_image(raw_bytes: bytes) -> Image.Image:
+    """Decode raw image bytes into an RGB PIL image.
 
     Handles palette-mode PNGs with transparency (common for rendered diagrams
     such as molecule structures): converts via RGBA then composites onto a
@@ -233,10 +310,17 @@ def _load_rgb_image(path: str) -> Image.Image:
     transparent region with an arbitrary palette color, which silently shifts
     the background distribution away from "white" and emits a PIL warning per
     image.
+
+    This helper is the single source of truth for "bytes → RGB PIL" used both
+    at encode time (to feed into the image_processor for grid_thw) and, more
+    importantly, at training time inside ``CachedEncodedDataset`` which must
+    reproduce the same RGB conversion to get bit-identical pixel_values.
     """
-    img = Image.open(path)
+    img = Image.open(BytesIO(raw_bytes))
     mode = img.mode
     if mode == 'RGB':
+        # Force decode now so downstream doesn't hit IO surprises.
+        img.load()
         return img
     if mode == 'RGBA' or (mode == 'P' and 'transparency' in img.info):
         rgba = img.convert('RGBA')
@@ -246,9 +330,20 @@ def _load_rgb_image(path: str) -> Image.Image:
     return img.convert('RGB')
 
 
-def _load_pil(path: str, image_root: str) -> Optional[Image.Image]:
+def _load_image(path: str, image_root: str) -> Optional[Dict[str, Any]]:
+    """Read raw bytes + produce an RGB PIL image.
+
+    Returns a ``{'pil': Image.Image, 'raw': bytes}`` dict, or ``None`` on any
+    failure (missing file, bad bytes, etc.). We always read the raw bytes
+    (even in pixel_values mode) because it's the same cost as ``Image.open``
+    with a file path and lets the caller freely choose what to serialize.
+    """
     try:
-        return _load_rgb_image(os.path.join(image_root, path))
+        abs_path = os.path.join(image_root, path)
+        with open(abs_path, 'rb') as f:
+            raw = f.read()
+        pil = _decode_rgb_image(raw)
+        return {'pil': pil, 'raw': raw}
     except Exception:
         return None
 
@@ -259,6 +354,7 @@ def _build_batch(
     image_root: str,
     strict: bool,
     io_threads: int,
+    store_mode: str,
 ) -> Dict[str, List[Any]]:
     """Process a batch of rows.
 
@@ -268,6 +364,11 @@ def _build_batch(
       * A ThreadPoolExecutor overlaps image disk I/O (I/O bound, releases the
         GIL during disk read) with image-processor CPU work. This is the main
         speedup on network-mounted image storage (e.g. /fsx).
+
+    Irrespective of ``store_mode`` we always call the image_processor to get
+    the authoritative ``image_grid_thw``: in ``image_bytes`` mode we throw
+    away the decoded pixel_values right after (saves ~50x storage) but the
+    grid_thw is written into the cache so training produces the same n_pad.
     """
     processor = _get_processor(model_id)
     merge_size = int(getattr(processor.image_processor, 'merge_size', 2))
@@ -294,7 +395,8 @@ def _build_batch(
                 raise
             plans.append(None)
 
-    # Pass 2: flat (row_idx, img_idx, path) list, then parallel PIL load.
+    # Pass 2: flat (row_idx, img_idx, path) list, then parallel load.
+    # `_load_image` returns {'pil': <Image>, 'raw': <bytes>} per image.
     flat: List = []
     for row_idx, plan in enumerate(plans):
         if plan is None:
@@ -302,18 +404,22 @@ def _build_batch(
         for j, path in enumerate(plan['images']):
             flat.append((row_idx, j, path))
 
-    pil_by_row: Dict[int, List[Image.Image]] = {}
+    # Per row: keep PIL images (for image_processor) and raw bytes (for
+    # image_bytes storage mode). Same list order in both, keyed on row index.
+    loaded_by_row: Dict[int, List[Dict[str, Any]]] = {}
     if flat:
         max_workers = max(1, min(io_threads, len(flat)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            loaded = list(ex.map(lambda item: (item[0], item[1], _load_pil(item[2], image_root)), flat))
+            loaded = list(ex.map(
+                lambda item: (item[0], item[1], _load_image(item[2], image_root)),
+                flat))
 
         failed_rows = set()
-        for row_idx, _j, img in loaded:
-            if img is None:
+        for row_idx, _j, payload in loaded:
+            if payload is None:
                 failed_rows.add(row_idx)
                 continue
-            pil_by_row.setdefault(row_idx, []).append(img)
+            loaded_by_row.setdefault(row_idx, []).append(payload)
 
         for row_idx in failed_rows:
             if strict:
@@ -323,9 +429,9 @@ def _build_batch(
         for row_idx, plan in enumerate(plans):
             if plan is None:
                 continue
-            if len(pil_by_row.get(row_idx, [])) != len(plan['images']):
+            if len(loaded_by_row.get(row_idx, [])) != len(plan['images']):
                 if strict:
-                    raise RuntimeError(f'PIL load count mismatch for row {row_idx}.')
+                    raise RuntimeError(f'image load count mismatch for row {row_idx}.')
                 plans[row_idx] = None
 
     # Pass 3: per-row image-processor call + output assembly.
@@ -346,21 +452,35 @@ def _build_batch(
             _append_none()
             continue
         try:
-            pil_images = pil_by_row.get(row_idx, [])
-            if pil_images:
-                image_inputs = processor.image_processor(images=pil_images, return_tensors='pt')
-                pixel_values = image_inputs['pixel_values']
+            loaded_items = loaded_by_row.get(row_idx, [])
+            if loaded_items:
+                pil_images = [item['pil'] for item in loaded_items]
+                raw_bytes_list = [item['raw'] for item in loaded_items]
+                image_inputs = processor.image_processor(
+                    images=pil_images, return_tensors='pt')
                 image_grid_thw = image_inputs['image_grid_thw']
                 if image_grid_thw.shape[0] != len(plan['regions']):
                     raise ValueError(
                         f'image_processor returned {image_grid_thw.shape[0]} grids but '
                         f'row has {len(plan["regions"])} image regions.')
+                # Only keep the heavy pixel_values tensor in pixel_values mode.
+                pixel_values = (
+                    image_inputs['pixel_values']
+                    if store_mode == STORE_MODE_PIXEL_VALUES else None)
             else:
                 pixel_values = None
                 image_grid_thw = None
+                raw_bytes_list = None
 
             row_out = _assemble_row(
-                plan['input_ids'], plan['regions'], pixel_values, image_grid_thw, merge_len)
+                plan['input_ids'],
+                plan['regions'],
+                pixel_values,
+                image_grid_thw,
+                raw_bytes_list,
+                merge_len,
+                store_mode,
+            )
             for k in out:
                 out[k].append(row_out[k])
         except Exception:
@@ -425,6 +545,16 @@ def main():
     parser.add_argument('--shuffle_subset', action='store_true',
                         help='Debug knob: shuffle the subset selected by --offset/--limit, so '
                              'you see a random sample instead of only the first rows.')
+    parser.add_argument('--store_mode', choices=VALID_STORE_MODES, default=STORE_MODE_IMAGE_BYTES,
+                        help='How to serialize image data into the cache:\n'
+                             '  image_bytes  (default) store raw JPEG/PNG bytes + image_grid_thw;\n'
+                             '                training runs image_processor on demand.\n'
+                             '                Storage scales with compressed JPEG size (~50-150KB/row).\n'
+                             '  pixel_values  store fp16 pixel_values tensor + image_grid_thw;\n'
+                             '                training reads them with zero image CPU work.\n'
+                             '                Storage scales with decoded tensor size (~2-3MB/row),\n'
+                             '                i.e. 20-50x bigger than image_bytes.\n'
+                             'Both modes produce bit-identical per-batch tensors at training time.')
     args = parser.parse_args()
 
     if args.max_pixels is not None:
@@ -432,6 +562,21 @@ def main():
     if args.min_pixels is not None:
         _PROCESSOR_KWARGS['min_pixels'] = args.min_pixels
     _get_processor(args.model)
+
+    # Base metadata describing this cache; written at cache root + per-shard.
+    # `store_mode` + `model` + (max_pixels, min_pixels) are what the training
+    # reader needs to reproduce the image_processor call that produced the
+    # authoritative ``image_grid_thw`` recorded in the Arrow dataset.
+    meta_base: Dict[str, Any] = {
+        'full_encode': True,
+        'packing': False,
+        'store_mode': args.store_mode,
+        'model': args.model,
+        'source_dataset': args.source_dataset,
+        'image_root': args.image_root,
+        'max_pixels': args.max_pixels,
+        'min_pixels': args.min_pixels,
+    }
 
     dataset = load_from_disk(args.source_dataset)
     total_rows = len(dataset)
@@ -457,9 +602,10 @@ def main():
     model_id = args.model
     image_root = args.image_root
     io_threads = args.io_threads
+    store_mode = args.store_mode
 
     def _map_fn(batch):
-        return _build_batch(batch, model_id, image_root, strict, io_threads)
+        return _build_batch(batch, model_id, image_root, strict, io_threads, store_mode)
 
     def _encode_and_save(src, out_dir, desc):
         """Apply map+filter to `src` and atomically materialize train[/val] subdirs at `out_dir`.
@@ -468,6 +614,11 @@ def main():
         A crash therefore leaves at most a ``.tmp`` sibling, never a half-finished
         ``out_dir``. The caller uses ``os.path.exists(out_dir)`` as the "done"
         marker when resuming.
+
+        We also drop a ``cache_meta.json`` inside ``tmp_dir`` before the rename,
+        so the successfully-committed output is always self-describing: the
+        training reader can recover image_processor settings from any cached
+        dir (per-shard or per-output) without reading a remote/separate file.
         """
         tmp_dir = out_dir + '.tmp'
         if os.path.exists(tmp_dir):
@@ -503,6 +654,14 @@ def main():
         else:
             processed.save_to_disk(os.path.join(tmp_dir, 'train'), **save_kwargs)
             train_n = len(processed)
+
+        # Drop per-shard cache_meta.json so the shard is self-describing.
+        # (The same fields are also written once at the cache-root level in
+        # main(); having both lets training code find meta regardless of
+        # which path it was handed.)
+        with open(os.path.join(tmp_dir, 'cache_meta.json'), 'w') as f:
+            json.dump({**meta_base, 'train_samples': train_n, 'val_samples': val_n},
+                      f, indent=2, ensure_ascii=False)
 
         os.rename(tmp_dir, out_dir)
         return train_n, val_n
@@ -562,11 +721,7 @@ def main():
                 f'ETA={remain/3600:.1f}h) -> {shard_dir}')
 
         meta = {
-            'full_encode': True,
-            'packing': False,
-            'model': args.model,
-            'source_dataset': args.source_dataset,
-            'image_root': args.image_root,
+            **meta_base,
             'shard_rows': shard_rows,
             'num_shards': num_shards,
             'train_shard_paths': train_paths,
@@ -612,11 +767,9 @@ def main():
             print(f'cached_val_dataset: `{val_dir}` ({vn} samples)')
 
         meta = {
-            'full_encode': True,
-            'packing': False,
-            'model': args.model,
-            'source_dataset': args.source_dataset,
-            'image_root': args.image_root,
+            **meta_base,
+            'total_train_samples': tn,
+            'total_val_samples': vn,
         }
         meta_path = os.path.join(args.output_dir, 'cache_meta.json')
         with open(meta_path, 'w') as f:

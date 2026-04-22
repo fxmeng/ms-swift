@@ -14,6 +14,14 @@
 # `dataset.save_to_disk(...)`; we load it here with `load_from_disk`.
 
 # --- Step 1: encode source dataset into full_encode cache ---
+# Storage mode: --store_mode image_bytes (default, recommended for
+# pretraining-scale corpora): stores raw JPEG/PNG bytes + image_grid_thw.
+# Training re-runs the image_processor on demand with the same max_pixels /
+# min_pixels recorded in cache_meta.json, producing bit-identical
+# pixel_values to the legacy "pixel_values" mode but with ~20-50x smaller
+# cache files. Use --store_mode pixel_values to revert to the zero-CPU-at-
+# training-time behavior if storage isn't a concern.
+#
 # Tuning tips — check `top` first to see what the bottleneck actually is:
 #   * %wa > 0 and %us low            → I/O bound → raise --io_threads (8-16).
 #   * %wa ~= 0 and %us ~= 100%       → CPU bound → the image processor is the
@@ -57,7 +65,8 @@ python examples/train/cached_dataset/encode_pretrain_vl.py \
     --max_shard_size 2GB \
     --save_num_proc 16 \
     --shard_rows 500000 \
-    --val_ratio 0.01
+    --val_ratio 0.01 \
+    --store_mode image_bytes
 
 # Output after Step 1 (shard mode):
 #   qwen3_vl_pretrain_cached/
@@ -110,6 +119,13 @@ shopt -u nullglob
 # --cached_dataset / --cached_val_dataset / --cached_packing_dataset each
 # accept a list of paths and concatenate them at load time, so no final
 # merge step is required.
+#
+# dataloader_num_workers for image_bytes mode: image_bytes caches defer the
+# JPEG-decode + image_processor call to dataloader workers at training time.
+# Each worker processes one sample at a time; at fp16 inference the per-image
+# cost is O(<10ms) on modern CPUs for our max_pixels budget, so 8-16 workers
+# per rank is usually enough to stay ahead of the GPU. Bump it up if you see
+# GPU util dropping on small batch sizes.
 #
 # Use `shard-*` (not `*`) so leftover `.tmp` dirs from a prior crash are
 # excluded. nullglob makes unmatched patterns expand to nothing, so VAL_SHARDS
