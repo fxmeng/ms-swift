@@ -66,7 +66,14 @@ python examples/train/cached_dataset/encode_pretrain_vl.py \
     --save_num_proc 16 \
     --shard_rows 500000 \
     --val_ratio 0.01 \
-    --store_mode image_bytes
+    --store_mode image_bytes \
+    --max_length 4096
+    # --max_length 4096 MUST match the --max_length used at training time
+    # (Step 3 below). If it doesn't, ms-swift's training-side `_select_dataset`
+    # will re-filter the shard → `dataset_modified = True` → the precomputed
+    # packing cache is silently ignored and packing is recomputed at each
+    # training launch. Keeping the two in sync lets Step 2's packing arrow
+    # actually get used.
 
 # Output after Step 1 (shard mode):
 #   qwen3_vl_pretrain_cached/
@@ -153,7 +160,7 @@ IMAGE_MAX_TOKEN_NUM=1024 \
 VIDEO_MAX_TOKEN_NUM=128 \
 FPS_MAX_FRAMES=16 \
 megatron pt \
-    --model Qwen/Qwen3-VL-30B-A3B-Instruct \
+    --model /huggingface/Qwen/Qwen3-VL-30B-A3B-Instruct \
     --save_safetensors true \
     --cached_dataset         "${TRAIN_SHARDS[@]}" \
     --cached_val_dataset     "${VAL_SHARDS[@]}" \
@@ -181,9 +188,9 @@ megatron pt \
     --save_steps 500 \
     --max_length 4096 \
     --packing true \
-    --freeze_llm true \
-    --freeze_vit true \
+    --freeze_llm false \
     --freeze_aligner false \
+    --freeze_vit true \
     --dataloader_num_workers 8 \
     --dataset_num_proc 8 \
     --no_save_optim true \
@@ -193,4 +200,5 @@ megatron pt \
     --optimizer_cpu_offload true \
     --use_precision_aware_optimizer true \
     --optimizer_offload_fraction 0.2 \
-    --attention_backend flash
+    --attention_backend flash \
+    --tensorboard_dir /tmp/tensorboard_logs

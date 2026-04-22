@@ -355,6 +355,7 @@ def _build_batch(
     strict: bool,
     io_threads: int,
     store_mode: str,
+    max_length: Optional[int],
 ) -> Dict[str, List[Any]]:
     """Process a batch of rows.
 
@@ -481,6 +482,19 @@ def _build_batch(
                 merge_len,
                 store_mode,
             )
+            # Drop rows whose encoded length exceeds max_length. The training
+            # loader (swift/pipelines/utils.py `_select_dataset`) applies the
+            # exact same filter: max(lengths) <= max_length. Pre-filtering
+            # here keeps the encoded shard size == what training sees, which
+            # is what ``swift export --cached_dataset --packing`` assumes when
+            # it writes `packed_idx`. Without this filter, even a handful of
+            # oversize rows (8 / 491k in our corpus) causes ms-swift to mark
+            # the dataset as "modified" at training time and silently skip
+            # the precomputed packing cache. This is NOT treated as a strict
+            # failure; it's an expected soft drop.
+            if max_length is not None and len(row_out['input_ids']) > max_length:
+                _append_none()
+                continue
             for k in out:
                 out[k].append(row_out[k])
         except Exception:
@@ -555,6 +569,14 @@ def main():
                              '                Storage scales with decoded tensor size (~2-3MB/row),\n'
                              '                i.e. 20-50x bigger than image_bytes.\n'
                              'Both modes produce bit-identical per-batch tensors at training time.')
+    parser.add_argument('--max_length', type=int, default=None,
+                        help='If set, drop any sample whose encoded input_ids length exceeds '
+                             'this value. Must match the --max_length you will use at training '
+                             'time: ms-swift applies the same filter at load time, and a mismatch '
+                             'between the cached shard and the training-filtered shard invalidates '
+                             'any precomputed packing cache (forcing on-the-fly packing every run). '
+                             'Typical value: 4096. Leave unset to keep the legacy behavior of '
+                             'writing all rows and deferring length filtering to training.')
     args = parser.parse_args()
 
     if args.max_pixels is not None:
@@ -576,6 +598,7 @@ def main():
         'image_root': args.image_root,
         'max_pixels': args.max_pixels,
         'min_pixels': args.min_pixels,
+        'max_length': args.max_length,
     }
 
     dataset = load_from_disk(args.source_dataset)
@@ -603,9 +626,11 @@ def main():
     image_root = args.image_root
     io_threads = args.io_threads
     store_mode = args.store_mode
+    max_length = args.max_length
 
     def _map_fn(batch):
-        return _build_batch(batch, model_id, image_root, strict, io_threads, store_mode)
+        return _build_batch(
+            batch, model_id, image_root, strict, io_threads, store_mode, max_length)
 
     def _encode_and_save(src, out_dir, desc):
         """Apply map+filter to `src` and atomically materialize train[/val] subdirs at `out_dir`.
@@ -637,6 +662,23 @@ def main():
         )
         processed = processed.filter(
             lambda r: r['input_ids'] is not None, num_proc=args.num_proc)
+
+        # Sanity check: the final ``lengths`` column must respect --max_length.
+        # ``_build_batch`` already drops oversize rows, so this is a belt-and-
+        # suspenders guard that catches silent regressions in the drop path
+        # (e.g. schema changes, off-by-one bugs). Reading only the ``lengths``
+        # column is cheap because Arrow is columnar: no pixel_values / image_
+        # bytes data is touched, so this is sub-second even on 500k-row shards.
+        if max_length is not None and len(processed) > 0:
+            lengths_col = processed['lengths']
+            actual_max = max(
+                (max(L) if isinstance(L, list) else L)
+                for L in lengths_col)
+            if actual_max > max_length:
+                raise RuntimeError(
+                    f'encode sanity check failed for `{out_dir}`: '
+                    f'max(lengths) = {actual_max} > --max_length = {max_length}. '
+                    f'This should never happen; inspect _build_batch drop path.')
 
         save_kwargs = {
             'max_shard_size': args.max_shard_size,
