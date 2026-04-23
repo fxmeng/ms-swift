@@ -19,9 +19,9 @@ Image region layout in the source `input_ids`:
 
 This script:
   1. Parses every <vision_start> ... <vision_end> region.
-  2. Loads each image and runs the Qwen3-VL image processor to get
-     the authoritative ``image_grid_thw`` (and, in ``pixel_values`` mode,
-     the decoded ``pixel_values`` tensor).
+  2. Loads each image and computes the authoritative ``image_grid_thw``
+     (either analytically via ``_smart_resize`` in preresize mode, or by
+     calling the Qwen3-VL image_processor once in non-preresize mode).
   3. Replaces the (possibly-wrong) number of image_pad tokens inside each
      region with the correct count:
          n_pad = image_grid_thw[i].prod() // (merge_size ** 2)
@@ -29,41 +29,30 @@ This script:
   5. Builds labels where image regions (<vision_start>, pads, discretes,
      <vision_end>) are masked with -100 and all text tokens are learned
      (pretraining). No Qwen chat-template prefix is added.
-  6. Writes an Arrow dataset whose schema is a superset of ms-swift's
+  6. Writes an Arrow dataset compatible with ms-swift's
      ``FullEncodePreprocessor`` schema plus an ``image_bytes`` column, so
      training can load it directly via ``--cached_dataset``.
 
-Storage modes (--store_mode):
+Storage: images are stored as JPEG/PNG bytes in the ``image_bytes`` column
+together with the authoritative ``image_grid_thw``. At training time,
+``CachedEncodedDataset`` re-runs the image_processor with the exact same
+``max_pixels`` / ``min_pixels`` recorded in ``cache_meta.json``, so the
+per-batch tensors downstream code sees are reproducible across runs.
+Cache size scales with compressed source images (~50-150 KB/row), ~20-50x
+smaller than storing decoded fp16 ``pixel_values`` tensors would be.
 
-  image_bytes   (default; recommended for pretraining-scale corpora)
-      Stores the raw on-disk bytes of each image (JPEG/PNG bytes, typically
-      50-150 KB/image) and the authoritative ``image_grid_thw``. At training
-      time ``CachedEncodedDataset`` re-runs the image_processor with the
-      exact same ``max_pixels`` / ``min_pixels`` recorded in ``cache_meta``,
-      producing bit-identical ``pixel_values`` to the legacy mode. Cache
-      size scales with the compressed source images (~50-150 KB/row) rather
-      than the decoded fp16 tensor (~2-3 MB/row in the legacy mode).
-
-  pixel_values  (legacy; single-pass encode, zero-CPU at training time)
-      Decodes images once, runs image_processor, and serializes the fp16
-      ``pixel_values`` tensor into the cache. Training reads them back with
-      zero image work. Produces 20-50x larger caches than ``image_bytes``
-      because JPEG-compressed bytes get expanded into dense float tensors.
-
-Both modes produce identical ``input_ids`` / ``labels`` / ``image_grid_thw``
-/ ``discrete_tokens`` and identical per-batch tensors at training time. The
-only difference is WHEN the decode+process work happens (encode vs. train).
+See ``--preresize_jpeg_quality`` for an even more compact layout that
+pre-resizes + re-encodes to target resolution at encode time; it trades
+bit-exact pixel reproducibility for smaller cache and faster training.
 
 Output layout:
-    {output_dir}/train/            Arrow dataset
-    {output_dir}/val/              Arrow dataset (when --val_ratio > 0)
     {output_dir}/cache_meta.json   Root metadata for the whole cache
     {output_dir}/shards/shard-XXXXXX-of-YYYYYY/
         cache_meta.json            Per-shard metadata (identical fields);
                                    makes the shard dir self-describing so
                                    training can recover image_processor
                                    settings from any shard path alone.
-        train/ val/
+        train/ val/                Arrow datasets
 
 Example:
     python encode_pretrain_vl.py \
@@ -71,7 +60,7 @@ Example:
         --source_dataset /path/to/saved_to_disk_dir \
         --image_root /fsx/youtu-vl/jiayikuang/data_02111332/vl_images/ \
         --output_dir ./qwen3_vl_pretrain_cached \
-        --store_mode image_bytes \
+        --shard_rows 500000 \
         --num_proc 8 \
         --val_ratio 0.01
 """
@@ -81,6 +70,8 @@ import json
 import math
 import os
 import shutil
+import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -97,7 +88,7 @@ import torch  # noqa: E402
 import warnings  # noqa: E402
 from io import BytesIO  # noqa: E402
 from datasets import Features, Sequence, Value, load_from_disk  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageOps  # noqa: E402
 
 # Silence PIL noise about palette-mode PNGs with transparency. We handle those
 # images correctly below via _load_rgb_image (RGBA-composite onto white).
@@ -107,6 +98,15 @@ warnings.filterwarnings(
     message='Palette images with Transparency.*',
     category=UserWarning,
 )
+
+# Decompression-bomb cap: any source image with more than this many pixels
+# raises ``Image.DecompressionBombError`` on decode, which ``_load_image``
+# catches and turns into a dropped row. PIL's default (~89M pixels) only emits
+# a *warning* and still loads the image — that's what causes OOMs on 128-proc
+# runs where a few rogue 20kx20k PNGs can collectively balloon to >100 GB of
+# uint8 arrays. At our typical ``max_pixels <= 1.3M``, any source > 200M
+# pixels is pathological and cheaper to drop than to downscale.
+Image.MAX_IMAGE_PIXELS = 200_000_000
 
 # torch has its own intra-op / inter-op thread pools independent of OMP.
 torch.set_num_threads(1)
@@ -124,34 +124,29 @@ IMAGE_PAD_ID = 151655
 # Explicit schema keeps multi-shard / multi-proc map() from breaking when some
 # shards contain only text-only rows (where image fields are all None/empty).
 #
-# `image_bytes` (new) stores raw on-disk JPEG/PNG bytes per image. It coexists
-# with `pixel_values_bytes` (legacy, decoded fp16 tensor) so a cache built in
-# either mode is loadable by the same training code, which picks the mode at
-# runtime based on which column is populated (see swift/dataset/utils.py
-# CachedEncodedDataset).
+# `image_bytes` stores raw on-disk JPEG/PNG bytes per image. The legacy
+# `pixel_values_bytes` / video columns are kept in the schema for
+# compatibility with ms-swift's ``FullEncodePreprocessor`` (which *writes*
+# them) and ``CachedEncodedDataset`` (which *reads* them): our encoder here
+# always leaves them ``None``, but the columns must exist so a dataset built
+# by us and a dataset built by ``swift export --full_encode`` share a single
+# Arrow schema and can be concat / packed interchangeably.
 OUTPUT_FEATURES = Features({
     'input_ids': Sequence(Value('int32')),
     'labels': Sequence(Value('int32')),
     'lengths': Sequence(Value('int32')),
     'loss_scale': Sequence(Value('float32')),
     'discrete_tokens': Sequence(Sequence(Value('int32'))),
-    # image_bytes mode:
     'image_bytes': Sequence(Value('binary')),
-    # pixel_values mode (legacy):
+    # Legacy / ms-swift-native columns (always None in this script):
     'pixel_values_bytes': Value('binary'),
     'pixel_values_shape': Sequence(Value('int32')),
-    # videos (unused by this script, kept for schema compat):
     'pixel_values_videos_bytes': Value('binary'),
     'pixel_values_videos_shape': Sequence(Value('int32')),
-    # grid_thw shared by both modes:
+    # Grid_thw (authoritative, populated in both modes):
     'image_grid_thw': Sequence(Sequence(Value('int32'))),
     'video_grid_thw': Sequence(Sequence(Value('int32'))),
 })
-
-# Storage modes.
-STORE_MODE_IMAGE_BYTES = 'image_bytes'
-STORE_MODE_PIXEL_VALUES = 'pixel_values'
-VALID_STORE_MODES = (STORE_MODE_IMAGE_BYTES, STORE_MODE_PIXEL_VALUES)
 
 _PROCESSOR_CACHE: Dict[str, Any] = {}
 # Populated once in main() and inherited by forked workers. Avoids passing
@@ -170,6 +165,62 @@ def _get_processor(model_id: str):
                 setattr(processor.image_processor, k, v)
         _PROCESSOR_CACHE[model_id] = processor
     return _PROCESSOR_CACHE[model_id]
+
+
+def _smart_resize(height: int, width: int, factor: int, min_pixels: int, max_pixels: int):
+    """Reimplementation of Qwen2VL's ``smart_resize`` that matches the processor bit-for-bit.
+
+    Kept here so we can compute the authoritative ``(h_bar, w_bar)`` (and
+    therefore ``image_grid_thw``) without going through the full
+    ``image_processor`` pipeline. That pipeline's hot path is rescale +
+    normalize + patch-flatten, which is ~30-40ms / image on CPU. In preresize
+    mode we don't need those outputs — just the target size — so this helper
+    lets us skip the expensive part entirely.
+
+    Invariant: for any (height, width) that Qwen's processor would accept,
+    this function returns the same ``(h_bar, w_bar)`` as
+    ``transformers.models.qwen2_vl.image_processing_qwen2_vl.smart_resize``.
+    """
+    # Reject zero/negative dimensions up front. Without this the ``min_pixels``
+    # branch divides by (height * width) and blows up with ZeroDivisionError
+    # (or produces inf propagating into floor/ceil). ``_load_image`` + the
+    # Pass 2.5 tiny-image filter normally catch these first, but this guard
+    # keeps the helper safe to call in isolation (e.g. from tests).
+    if height <= 0 or width <= 0:
+        raise ValueError(f'_smart_resize got non-positive size: height={height}, width={width}')
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = math.floor(height / beta / factor) * factor
+        w_bar = math.floor(width / beta / factor) * factor
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return int(h_bar), int(w_bar)
+
+
+def _preresize_and_encode_jpeg(pil_img: Image.Image, factor: int, min_pixels: int,
+                               max_pixels: int, quality: int):
+    """Resize ``pil_img`` to the smart_resize target, re-encode as JPEG, return (bytes, (h_bar, w_bar)).
+
+    Uses BICUBIC to match the image_processor's default resample mode, so
+    that at training time (when the processor's smart_resize becomes a no-op
+    because the image is already at target size) the resulting pixel_values
+    differ from the "store original bytes" path only by the JPEG re-encode
+    quantization noise (~±1 LSB / channel at Q95).
+
+    subsampling=0 (4:4:4 chroma) keeps full color fidelity — the default 4:2:0
+    would halve chroma resolution, visibly degrading small-text OCR images.
+    """
+    w, h = pil_img.size
+    h_bar, w_bar = _smart_resize(h, w, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
+    if (h, w) != (h_bar, w_bar):
+        pil_img = pil_img.resize((w_bar, h_bar), Image.BICUBIC)
+    buf = BytesIO()
+    pil_img.save(buf, format='JPEG', quality=quality, subsampling=0, optimize=False)
+    return buf.getvalue(), (h_bar, w_bar)
 
 
 def _parse_image_regions(input_ids: List[int]) -> List[Dict[str, Any]]:
@@ -205,27 +256,21 @@ def _parse_image_regions(input_ids: List[int]) -> List[Dict[str, Any]]:
 def _assemble_row(
     orig_input_ids: List[int],
     regions: List[Dict[str, Any]],
-    pixel_values: Optional[torch.Tensor],
     image_grid_thw: Optional[torch.Tensor],
     raw_image_bytes: Optional[List[bytes]],
     merge_len: int,
-    store_mode: str,
 ) -> Dict[str, Any]:
     """Build one output row.
 
     Args:
         orig_input_ids: source sequence (contains the original vision regions).
         regions: parsed <vision_start> / <vision_end> spans.
-        pixel_values: image_processor output stacked across regions. Required
-            for ``store_mode == 'pixel_values'``; may be ``None`` in
-            ``image_bytes`` mode (unused there).
         image_grid_thw: per-image ``(T, H_patches, W_patches)`` tensor,
             authoritative for n_pad computation. Required whenever there are
             images.
-        raw_image_bytes: original on-disk bytes per image. Required for
-            ``image_bytes`` mode; unused for ``pixel_values`` mode.
+        raw_image_bytes: original / pre-resized on-disk bytes per image;
+            required whenever ``regions`` is non-empty.
         merge_len: ``merge_size ** 2``; used to compute n_pad from the grid.
-        store_mode: one of ``VALID_STORE_MODES``.
     """
     new_input_ids: List[int] = []
     new_labels: List[int] = []
@@ -265,7 +310,7 @@ def _assemble_row(
         new_input_ids.extend(tail)
         new_labels.extend(tail)
 
-    # Base row; fill image-side columns below depending on store_mode.
+    # Base row; legacy columns are always None (kept for schema compat).
     result: Dict[str, Any] = {
         'input_ids': new_input_ids,
         'labels': new_labels,
@@ -281,23 +326,13 @@ def _assemble_row(
         'video_grid_thw': None,
     }
 
-    has_images = image_grid_thw is not None and len(image_grid_thw) > 0
-    if has_images:
+    if image_grid_thw is not None:
         result['image_grid_thw'] = image_grid_thw.tolist()
-        if store_mode == STORE_MODE_PIXEL_VALUES:
-            if pixel_values is None:
-                raise ValueError('pixel_values is required in pixel_values store_mode')
-            t = pixel_values.to(torch.float16).contiguous()
-            result['pixel_values_bytes'] = t.numpy().tobytes()
-            result['pixel_values_shape'] = list(t.shape)
-        elif store_mode == STORE_MODE_IMAGE_BYTES:
-            if raw_image_bytes is None or len(raw_image_bytes) != len(regions):
-                raise ValueError(
-                    'raw_image_bytes must be provided for every region in '
-                    'image_bytes store_mode')
-            result['image_bytes'] = list(raw_image_bytes)
-        else:
-            raise ValueError(f'unknown store_mode: {store_mode}')
+        if raw_image_bytes is None or len(raw_image_bytes) != len(regions):
+            raise ValueError(
+                'raw_image_bytes must be provided for every region '
+                f'(regions={len(regions)}, got {None if raw_image_bytes is None else len(raw_image_bytes)})')
+        result['image_bytes'] = list(raw_image_bytes)
     return result
 
 
@@ -317,6 +352,13 @@ def _decode_rgb_image(raw_bytes: bytes) -> Image.Image:
     reproduce the same RGB conversion to get bit-identical pixel_values.
     """
     img = Image.open(BytesIO(raw_bytes))
+    # Apply EXIF orientation. Phone cameras almost always write JPEGs with
+    # Orientation=6/8 rather than pre-rotating pixels; PIL does *not* auto-
+    # rotate on ``Image.open`` or ``.convert('RGB')``, so without this step
+    # our cache silently stores sideways / upside-down images and training
+    # sees them that way too. ``exif_transpose`` is a no-op when there's no
+    # EXIF tag, so it's safe to run unconditionally.
+    img = ImageOps.exif_transpose(img)
     mode = img.mode
     if mode == 'RGB':
         # Force decode now so downstream doesn't hit IO surprises.
@@ -334,15 +376,21 @@ def _load_image(path: str, image_root: str) -> Optional[Dict[str, Any]]:
     """Read raw bytes + produce an RGB PIL image.
 
     Returns a ``{'pil': Image.Image, 'raw': bytes}`` dict, or ``None`` on any
-    failure (missing file, bad bytes, etc.). We always read the raw bytes
-    (even in pixel_values mode) because it's the same cost as ``Image.open``
-    with a file path and lets the caller freely choose what to serialize.
+    failure (missing file, bad bytes, etc.). Reading raw bytes up-front is
+    the same cost as ``Image.open`` from a path and lets us forward them to
+    the ``image_bytes`` storage column when not preresizing.
     """
     try:
         abs_path = os.path.join(image_root, path)
         with open(abs_path, 'rb') as f:
             raw = f.read()
         pil = _decode_rgb_image(raw)
+        w, h = pil.size
+        if w <= 0 or h <= 0:
+            # Treat zero/negative dimensions as a load failure so downstream
+            # smart_resize / image_processor never sees them. Rare but real:
+            # some SVG-like PNGs + libjpeg edge cases produce (0, *) sizes.
+            return None
         return {'pil': pil, 'raw': raw}
     except Exception:
         return None
@@ -354,10 +402,12 @@ def _build_batch(
     image_root: str,
     strict: bool,
     io_threads: int,
-    store_mode: str,
     max_length: Optional[int],
+    preresize_jpeg_quality: Optional[int],
+    drop_below_min_pixels: bool,
+    max_aspect_ratio: Optional[float],
 ) -> Dict[str, List[Any]]:
-    """Process a batch of rows.
+    """Process a batch of rows into the cached output schema.
 
     Optimizations vs. per-row processing:
       * ``datasets.map(batched=True)`` amortizes map/pickle/arrow overhead
@@ -366,35 +416,147 @@ def _build_batch(
         GIL during disk read) with image-processor CPU work. This is the main
         speedup on network-mounted image storage (e.g. /fsx).
 
-    Irrespective of ``store_mode`` we always call the image_processor to get
-    the authoritative ``image_grid_thw``: in ``image_bytes`` mode we throw
-    away the decoded pixel_values right after (saves ~50x storage) but the
-    grid_thw is written into the cache so training produces the same n_pad.
+    The authoritative ``image_grid_thw`` is computed either analytically via
+    ``_smart_resize`` (when ``preresize_jpeg_quality`` is set) or by calling
+    the image_processor once; either way its decoded ``pixel_values`` tensor
+    is discarded and only the bytes + grid are written to disk.
     """
     processor = _get_processor(model_id)
-    merge_size = int(getattr(processor.image_processor, 'merge_size', 2))
+    ip = processor.image_processor
+    merge_size = int(getattr(ip, 'merge_size', 2))
     merge_len = merge_size * merge_size
+    patch_size = int(getattr(ip, 'patch_size', 14))
+    # `factor` is the smart_resize rounding unit: every resized side is a
+    # multiple of it. Qwen2VL uses patch_size * merge_size = 28.
+    factor = patch_size * merge_size
+    # Pull effective min/max pixels from the processor (already populated from
+    # --max_pixels/--min_pixels via _PROCESSOR_KWARGS). Fall back to Qwen2VL
+    # defaults only if the processor somehow doesn't expose them.
+    min_pixels_eff = int(getattr(ip, 'min_pixels', 56 * 56))
+    max_pixels_eff = int(getattr(ip, 'max_pixels', 14 * 14 * 4 * 1280))
+    # Full vocab size (base vocab + added/special tokens). Used to catch
+    # pre-tokenized source rows that were produced with a different (larger)
+    # tokenizer: any id >= vocab_size would index out-of-bounds in the model's
+    # embedding table at training time, producing NaN loss on the whole batch
+    # (which, under mixed precision + expert parallelism, is very hard to
+    # trace back to a specific cached row).
+    vocab_size = len(processor.tokenizer)
 
     n = len(batch['input_ids'])
 
     # Pass 1: parse regions per row.
+    # First-class, separately-counted drop reasons (see summary log at the
+    # bottom of this function). Keeping these as explicit branches instead
+    # of a generic try/except makes systemic data issues observable — e.g.
+    # if 40% of your source rows have region/image mismatches you want to
+    # know that on the first shard, not after a 10-hour encode run.
     plans: List[Optional[Dict[str, Any]]] = []
+    dropped_parse = 0           # malformed <vision_start>/<vision_end> markers
+    dropped_count_mismatch = 0  # #regions(input_ids) != #images(paths)
+    dropped_stray_pad = 0       # <image_pad> outside any vision region
+    dropped_oov = 0             # input_ids contains id out of [0, vocab_size)
     for i in range(n):
         try:
             orig_input_ids = list(batch['input_ids'][i])
             images = batch['images'][i] or []
             if isinstance(images, str):
                 images = [images]
-            regions = _parse_image_regions(orig_input_ids)
+            # Vocab-range check. ``max(orig_input_ids)`` is ~O(len) but pure
+            # C in CPython, so even at 4k tokens it's sub-microsecond. Do it
+            # before region parsing so we fail fast on garbage input_ids.
+            if orig_input_ids and (
+                    max(orig_input_ids) >= vocab_size or min(orig_input_ids) < 0):
+                dropped_oov += 1
+                if strict:
+                    raise ValueError(
+                        f'input_ids has out-of-vocab id: '
+                        f'min={min(orig_input_ids)} max={max(orig_input_ids)} '
+                        f'vocab_size={vocab_size}')
+                plans.append(None)
+                continue
+            try:
+                regions = _parse_image_regions(orig_input_ids)
+            except ValueError:
+                # Unmatched <vision_start>/<vision_end>: structurally invalid
+                # input_ids. Drop separately so users can distinguish this
+                # from the (much more common) region/image count mismatch.
+                dropped_parse += 1
+                if strict:
+                    raise
+                plans.append(None)
+                continue
             if len(regions) != len(images):
-                raise ValueError(
-                    f'Number of image regions ({len(regions)}) does not match '
-                    f'number of image paths ({len(images)}).')
+                # The input_ids claim N image regions but the row provides M
+                # image paths. Surviving this would either:
+                #   - under-count (len(images) < len(regions)): we have no
+                #     image to bind to one of the regions; image_processor
+                #     call would silently shift all subsequent region->image
+                #     mappings by one → every downstream image_pad refers
+                #     to the wrong image.
+                #   - over-count (len(images) > len(regions)): extra image
+                #     paths are loaded, wasting I/O, and image_grid_thw ends
+                #     up with more rows than there are regions, which we'd
+                #     catch later — but only after the expensive load.
+                # Filtering here is cheap (no image I/O yet) and is what the
+                # user actually wants: "<image> token count != real image count".
+                dropped_count_mismatch += 1
+                if strict:
+                    raise ValueError(
+                        f'Number of image regions ({len(regions)}) does not match '
+                        f'number of image paths ({len(images)}).')
+                plans.append(None)
+                continue
+            # Stray-image_pad check. Every IMAGE_PAD_ID must live strictly
+            # inside some (<vision_start>, <vision_end>) open interval. A pad
+            # outside any region would survive _assemble_row verbatim (only
+            # tokens *inside* regions are re-emitted via n_pad expansion), so
+            # at forward time it would hit the text embedding table at
+            # position IMAGE_PAD_ID and contribute pure noise to the loss on
+            # a position that *looks* like it should be an image token. We
+            # walk regions once with a pointer, O(n_tokens).
+            stray = False
+            if regions:
+                r_idx = 0
+                r_start = regions[0]['start']
+                r_end = regions[0]['end']
+                for idx, tok in enumerate(orig_input_ids):
+                    if tok != IMAGE_PAD_ID:
+                        continue
+                    while idx > r_end and r_idx + 1 < len(regions):
+                        r_idx += 1
+                        r_start = regions[r_idx]['start']
+                        r_end = regions[r_idx]['end']
+                    if not (r_start < idx < r_end):
+                        stray = True
+                        break
+            else:
+                # No regions at all: any IMAGE_PAD_ID is stray by definition.
+                if IMAGE_PAD_ID in orig_input_ids:
+                    stray = True
+            if stray:
+                dropped_stray_pad += 1
+                if strict:
+                    raise ValueError(
+                        'Found IMAGE_PAD_ID outside any <vision_start>/<vision_end> region.')
+                plans.append(None)
+                continue
             plans.append({'input_ids': orig_input_ids, 'regions': regions, 'images': images})
         except Exception:
             if strict:
                 raise
             plans.append(None)
+
+    if dropped_parse or dropped_count_mismatch or dropped_stray_pad or dropped_oov:
+        # Worker-local one-liner; with num_proc=128 you get up to 128 of these
+        # per batch interval, which is fine — they let you spot systemic data
+        # issues early (e.g. a sub-dataset with a broken export). Aggregating
+        # across workers is non-trivial in datasets.map, skipped by design.
+        print(
+            f'[encode] batch size={n}: dropped '
+            f'{dropped_count_mismatch} (image count mismatch) + '
+            f'{dropped_parse} (malformed vision markers) + '
+            f'{dropped_stray_pad} (stray IMAGE_PAD_ID) + '
+            f'{dropped_oov} (out-of-vocab input_ids)')
 
     # Pass 2: flat (row_idx, img_idx, path) list, then parallel load.
     # `_load_image` returns {'pil': <Image>, 'raw': <bytes>} per image.
@@ -435,6 +597,45 @@ def _build_batch(
                     raise RuntimeError(f'image load count mismatch for row {row_idx}.')
                 plans[row_idx] = None
 
+    # Pass 2.5: degenerate-image filters.
+    # Two independent filters, both checked on the raw PIL size (i.e. BEFORE
+    # any resize), so pathological sources never reach the processor.
+    #
+    # (a) tiny-image filter (--drop_below_min_pixels): smart_resize would
+    #     upscale a 1x1 PNG to 56x56 to satisfy min_pixels, producing a
+    #     constant-color patch that wastes training compute and emits the
+    #     "channel dimension is ambiguous" warning from transformers.
+    #
+    # (b) aspect-ratio filter (--max_aspect_ratio): matches transformers'
+    #     qwen2_vl.smart_resize ``MAX_RATIO`` validation. Without this,
+    #     a 1x20000 source would get smart_resize'd to (28, 19992) and
+    #     written into the cache by preresize mode; at training time the
+    #     processor would then re-validate and raise ValueError on that
+    #     same image, aborting the training run. Filtering at encode time
+    #     turns a fatal training-time crash into a silent encode-time drop.
+    #     This also guards the non-preresize code path: even when the
+    #     processor is called at encode time, it would raise on these rows
+    #     and poison the batch; the filter here drops them cleanly first.
+    # ``max_aspect_ratio`` is already normalized to ``None`` in main() when
+    # disabled (<= 0), so a non-None value here always means "check enabled".
+    if drop_below_min_pixels or max_aspect_ratio is not None:
+        for row_idx, items in list(loaded_by_row.items()):
+            if plans[row_idx] is None:
+                continue
+            drop = False
+            for item in items:
+                w, h = item['pil'].size
+                if drop_below_min_pixels and w * h < min_pixels_eff:
+                    drop = True
+                    break
+                if max_aspect_ratio is not None and min(w, h) > 0:
+                    ratio = max(w, h) / min(w, h)
+                    if ratio > max_aspect_ratio:
+                        drop = True
+                        break
+            if drop:
+                plans[row_idx] = None
+
     # Pass 3: per-row image-processor call + output assembly.
     # Keeping the processor call per-row (instead of stacking a mega-batch) is
     # intentional:
@@ -455,32 +656,57 @@ def _build_batch(
         try:
             loaded_items = loaded_by_row.get(row_idx, [])
             if loaded_items:
-                pil_images = [item['pil'] for item in loaded_items]
-                raw_bytes_list = [item['raw'] for item in loaded_items]
-                image_inputs = processor.image_processor(
-                    images=pil_images, return_tensors='pt')
-                image_grid_thw = image_inputs['image_grid_thw']
+                if preresize_jpeg_quality is not None:
+                    # Preresize mode: we never call the image_processor here.
+                    # Instead we do the (resize -> JPEG encode) step ourselves
+                    # and compute image_grid_thw analytically from the target
+                    # size. At training time the processor will see an image
+                    # that's already at target size, so its internal
+                    # smart_resize is a no-op and it just runs rescale +
+                    # normalize + patch-flatten on our JPEG-decoded pixels.
+                    #
+                    # Storage win comes from two compounding effects:
+                    #   1. we store at *target* resolution, not source (often
+                    #      10x+ smaller when sources are 4K JPEGs capped to
+                    #      ~1M pixels).
+                    #   2. JPEG at Q95/4:4:4 is ~8-10x smaller than PNG and
+                    #      ~3x smaller than WebP lossless.
+                    # Speed win at training time: resize is skipped (that's
+                    # the single most expensive step in the processor).
+                    raw_bytes_list = []
+                    grid_rows: List[List[int]] = []
+                    for item in loaded_items:
+                        jpeg_bytes, (h_bar, w_bar) = _preresize_and_encode_jpeg(
+                            item['pil'], factor, min_pixels_eff, max_pixels_eff,
+                            preresize_jpeg_quality)
+                        raw_bytes_list.append(jpeg_bytes)
+                        # grid_t=1 for single-frame images (temporal folding
+                        # happens inside the patch-flatten, not in grid_thw).
+                        grid_rows.append([1, h_bar // patch_size, w_bar // patch_size])
+                    image_grid_thw = torch.tensor(grid_rows, dtype=torch.long)
+                else:
+                    # Non-preresize: call the image_processor once to obtain
+                    # the authoritative image_grid_thw, then discard the
+                    # heavy ``pixel_values`` tensor (we only store bytes).
+                    pil_images = [item['pil'] for item in loaded_items]
+                    raw_bytes_list = [item['raw'] for item in loaded_items]
+                    image_inputs = processor.image_processor(
+                        images=pil_images, return_tensors='pt')
+                    image_grid_thw = image_inputs['image_grid_thw']
                 if image_grid_thw.shape[0] != len(plan['regions']):
                     raise ValueError(
-                        f'image_processor returned {image_grid_thw.shape[0]} grids but '
-                        f'row has {len(plan["regions"])} image regions.')
-                # Only keep the heavy pixel_values tensor in pixel_values mode.
-                pixel_values = (
-                    image_inputs['pixel_values']
-                    if store_mode == STORE_MODE_PIXEL_VALUES else None)
+                        f'got {image_grid_thw.shape[0]} grids but row has '
+                        f'{len(plan["regions"])} image regions.')
             else:
-                pixel_values = None
                 image_grid_thw = None
                 raw_bytes_list = None
 
             row_out = _assemble_row(
                 plan['input_ids'],
                 plan['regions'],
-                pixel_values,
                 image_grid_thw,
                 raw_bytes_list,
                 merge_len,
-                store_mode,
             )
             # Drop rows whose encoded length exceeds max_length. The training
             # loader (swift/pipelines/utils.py `_select_dataset`) applies the
@@ -503,6 +729,178 @@ def _build_batch(
             _append_none()
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-pod / multi-host shard claiming.
+#
+# Goal: let N independent processes (on different hosts, possibly different
+# pods / nodes) all encode into the same --output_dir without stepping on
+# each other, with no external coordinator (no DB, no Redis, no ZK).
+#
+# Model: each shard has three possible states on the shared filesystem:
+#   - committed:          shard-XXXXXX-of-YYYYYY/          (done, immutable)
+#   - claimed-in-flight:  shard-XXXXXX-of-YYYYYY.claim/    (someone working)
+#   - unclaimed:          (neither dir exists)             (free to grab)
+#
+# The claim directory is created with ``os.mkdir`` which is atomic on POSIX
+# and NFSv3+: exactly one process out of N concurrent callers wins the race,
+# the rest get FileExistsError. That single syscall is our mutual-exclusion
+# primitive — no advisory locks (flock isn't reliable on NFS), no rename
+# tricks, no external services.
+#
+# Inside the claim dir lives ``owner.json`` with {hostname, pid, started_ts,
+# heartbeat_ts}. A daemon thread in the owning process re-writes heartbeat_ts
+# every ``heartbeat_interval`` seconds. Other processes, on seeing a claim
+# dir, read heartbeat_ts:
+#   - fresh (heartbeat_ts within stale_threshold): skip this shard, try next
+#   - stale (last heartbeat > stale_threshold ago): the owner is dead (pod
+#     evicted, node crashed, OOM'd); rmtree the claim and attempt to mkdir
+#     it ourselves. The rmtree-then-mkdir sequence is racy with other
+#     stealers, but mkdir is the final arbiter: only one wins.
+#
+# Failure modes handled:
+#   - Pod killed mid-shard:        heartbeat stops → after 10min another pod
+#                                  steals the claim, re-processes the shard.
+#   - NFS metadata cache lag:      heartbeat writes use rename-in-place which
+#                                  forces NFS to invalidate and flush; worst-
+#                                  case we see ~30s of staleness.
+#   - Two pods stealing at once:   one mkdir wins, the other gets FileExists
+#                                  and moves on (idempotent).
+#   - Crash during commit:         the atomic rename shard_dir.tmp → shard_dir
+#                                  is the commit point; either the shard is
+#                                  fully there or not. Partial shards are
+#                                  impossible.
+# ---------------------------------------------------------------------------
+
+def _claim_owner_info(claim_dir: str) -> Dict[str, Any]:
+    return {
+        'hostname': socket.gethostname(),
+        'pid': os.getpid(),
+        'started_ts': time.time(),
+        'heartbeat_ts': time.time(),
+        'claim_dir': claim_dir,
+    }
+
+
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    """Write JSON via ``tmp → rename`` so readers never see a partial file."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(payload, f)
+    os.rename(tmp, path)
+
+
+def _start_claim_heartbeat(claim_dir: str, interval_s: float) -> threading.Event:
+    """Spawn a daemon thread that updates owner.json every ``interval_s`` seconds.
+
+    Returns a stop Event: the caller must ``.set()`` it before releasing the
+    claim, otherwise a dying main thread would leave a zombie heartbeat
+    writing into an already-deleted directory.
+    """
+    owner_path = os.path.join(claim_dir, 'owner.json')
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(interval_s):
+            try:
+                # Re-read previous owner to preserve started_ts across beats.
+                if os.path.exists(owner_path):
+                    with open(owner_path) as f:
+                        owner = json.load(f)
+                else:
+                    owner = _claim_owner_info(claim_dir)
+                owner['heartbeat_ts'] = time.time()
+                _atomic_write_json(owner_path, owner)
+            except Exception:
+                # Claim dir may have been removed (we're shutting down) or
+                # filesystem is temporarily down; don't crash the encoder
+                # thread — the next beat will retry or the stop flag will fire.
+                pass
+
+    thread = threading.Thread(target=_beat, daemon=True, name='claim-heartbeat')
+    thread.start()
+    return stop
+
+
+def _read_claim_age(claim_dir: str) -> Optional[float]:
+    """Return seconds since last heartbeat, or ``None`` if unreadable.
+
+    Unreadable is treated by callers as "infinitely old" so the claim gets
+    stolen; this matches the intent (if we can't parse owner.json we're not
+    going to wait for it to self-heal).
+    """
+    owner_path = os.path.join(claim_dir, 'owner.json')
+    try:
+        with open(owner_path) as f:
+            owner = json.load(f)
+        return time.time() - float(owner.get('heartbeat_ts', 0))
+    except Exception:
+        return None
+
+
+def _try_claim_shard(shard_dir: str, claim_dir: str, stale_threshold_s: float,
+                     ) -> bool:
+    """Attempt to acquire an exclusive claim on ``shard_dir``.
+
+    Returns True iff we now own ``claim_dir`` (i.e. ``os.mkdir`` succeeded for
+    *us*, not some prior attempt). Callers MUST start a heartbeat on the
+    returned claim and MUST ``shutil.rmtree`` the claim after commit.
+    """
+    if os.path.exists(shard_dir):
+        return False  # already committed by someone; nothing to do.
+
+    # Fast path: no existing claim, we try to create one.
+    try:
+        os.mkdir(claim_dir)
+        _atomic_write_json(os.path.join(claim_dir, 'owner.json'),
+                           _claim_owner_info(claim_dir))
+        return True
+    except FileExistsError:
+        pass
+
+    # There's already a claim. Decide whether to steal.
+    age = _read_claim_age(claim_dir)
+    if age is not None and age < stale_threshold_s:
+        return False  # owner still alive, leave them alone.
+
+    # Stale or unreadable → attempt steal. rmtree + mkdir is racy across
+    # stealers, but mkdir is the final arbiter: only one wins.
+    try:
+        shutil.rmtree(claim_dir)
+    except FileNotFoundError:
+        pass  # someone else cleaned up before us, fine.
+    except Exception as e:
+        # FS permission / transient NFS error — give up on this shard for
+        # this pass; the next outer loop iteration or a subsequent run
+        # will try again.
+        print(f'[claim] failed to rmtree stale {claim_dir}: {e!r}')
+        return False
+
+    try:
+        os.mkdir(claim_dir)
+        _atomic_write_json(os.path.join(claim_dir, 'owner.json'),
+                           _claim_owner_info(claim_dir))
+        print(f'[claim] stole stale claim on {claim_dir} (age={age:.0f}s)')
+        return True
+    except FileExistsError:
+        # Raced with another stealer — they won. Move on.
+        return False
+
+
+def _release_claim(claim_dir: str, stop_heartbeat: Optional[threading.Event]) -> None:
+    """Stop heartbeat + remove claim dir. Idempotent; safe on double-call."""
+    if stop_heartbeat is not None:
+        stop_heartbeat.set()
+    try:
+        shutil.rmtree(claim_dir)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        # Log but don't raise: the shard itself is already committed
+        # (release is called *after* the rename). A lingering claim dir
+        # would self-expire via the stale-threshold path on the next run.
+        print(f'[claim] warning: failed to rmtree claim {claim_dir}: {e!r}')
 
 
 def main():
@@ -536,10 +934,11 @@ def main():
     parser.add_argument('--val_ratio', type=float, default=0.0,
                         help='If > 0, randomly hold out this ratio into {output_dir}/val (non-shard '
                              'mode) or into each shard\'s val/ subdir (shard mode).')
-    parser.add_argument('--shard_rows', type=int, default=0,
-                        help='Enable resumable shard mode: slice the source dataset into chunks of '
-                             'this many rows and process / save each chunk independently. 0 disables '
-                             'shard mode (legacy single-pass behavior). Typical value: 200000-500000.')
+    parser.add_argument('--shard_rows', type=int, required=True,
+                        help='Slice the source dataset into chunks of this many rows and process / '
+                             'save each chunk independently. Required: shard mode is the only '
+                             'supported mode (enables crash-resume + multi-pod cooperation). '
+                             'Typical value: 200000-500000.')
     parser.add_argument('--max_shard_size', type=str, default='2GB',
                         help='save_to_disk shard size (default datasets value is 500MB). Larger '
                              'shards mean fewer arrow files, which matters for multi-TB caches '
@@ -559,16 +958,15 @@ def main():
     parser.add_argument('--shuffle_subset', action='store_true',
                         help='Debug knob: shuffle the subset selected by --offset/--limit, so '
                              'you see a random sample instead of only the first rows.')
-    parser.add_argument('--store_mode', choices=VALID_STORE_MODES, default=STORE_MODE_IMAGE_BYTES,
-                        help='How to serialize image data into the cache:\n'
-                             '  image_bytes  (default) store raw JPEG/PNG bytes + image_grid_thw;\n'
-                             '                training runs image_processor on demand.\n'
-                             '                Storage scales with compressed JPEG size (~50-150KB/row).\n'
-                             '  pixel_values  store fp16 pixel_values tensor + image_grid_thw;\n'
-                             '                training reads them with zero image CPU work.\n'
-                             '                Storage scales with decoded tensor size (~2-3MB/row),\n'
-                             '                i.e. 20-50x bigger than image_bytes.\n'
-                             'Both modes produce bit-identical per-batch tensors at training time.')
+    parser.add_argument('--shuffle_source', action='store_true',
+                        help='Globally shuffle the source dataset (deterministic, --seed) before '
+                             'slicing into shards. Recommended for multi-source pretraining corpora '
+                             'that are only "soft-shuffled" (sub-datasets concatenated then mildly '
+                             'permuted): produces uniform per-shard sizes and within-shard domain '
+                             'diversity. Uses HF datasets index-only shuffling (near-free at 120M+ '
+                             'rows; no arrow rewrite). MUST stay consistent across resumable runs: '
+                             'toggling this mid-run makes already-committed shards point at a '
+                             'different slice of the source data than subsequent shards.')
     parser.add_argument('--max_length', type=int, default=None,
                         help='If set, drop any sample whose encoded input_ids length exceeds '
                              'this value. Must match the --max_length you will use at training '
@@ -577,32 +975,150 @@ def main():
                              'any precomputed packing cache (forcing on-the-fly packing every run). '
                              'Typical value: 4096. Leave unset to keep the legacy behavior of '
                              'writing all rows and deferring length filtering to training.')
+    parser.add_argument('--preresize_jpeg_quality', type=int, default=None,
+                        help='If set (e.g. 95), resize every image to its smart_resize target '
+                             '(derived from --max_pixels / --min_pixels) and re-encode as JPEG '
+                             'at this quality before storing, instead of keeping the original '
+                             'bytes.\n'
+                             'Trade-offs vs. storing original bytes:\n'
+                             '  + 5-20x smaller cache (stores at target resolution, not source).\n'
+                             '  + Faster training: processor skips resize (biggest CPU cost).\n'
+                             '  + Faster encode: one JPEG decode per image vs. decode + resize +\n'
+                             '    rescale + normalize + patch-flatten in the full processor call.\n'
+                             '  - NOT bit-identical: JPEG re-encode adds ~±1 LSB/channel noise at\n'
+                             '    Q95 (negligible for pretraining; do not use <Q90).\n'
+                             '  - Locks the cache to the (max_pixels, min_pixels) used at encode '
+                             '    time: changing them at training time has no effect because the '
+                             '    stored images are already at target size.\n'
+                             'Recommended: 95 for pretraining at scale, leave unset when you need '
+                             'exact pixel reproducibility (e.g. eval metric comparisons).')
+    parser.add_argument('--drop_below_min_pixels', action='store_true',
+                        help='Drop any sample that has at least one image smaller than the '
+                             'image_processor\'s min_pixels (i.e. H*W < min_pixels). These are '
+                             'typically degenerate sources (1x1 placeholders, corrupt thumbnails); '
+                             'without this flag smart_resize upscales them to satisfy min_pixels, '
+                             'producing a constant-color patch that wastes training compute and '
+                             'emits the "channel dimension is ambiguous" warning from transformers. '
+                             'Applies regardless of --preresize_jpeg_quality.')
+    parser.add_argument('--claim_stale_seconds', type=float, default=600.0,
+                        help='Multi-pod claim heartbeat timeout (seconds). When another pod\'s '
+                             'claim on a shard has not been refreshed for this long, we consider '
+                             'the owner dead and steal the claim. Must be safely larger than '
+                             'your longest expected shard duration: if a slow shard takes 20min '
+                             'to process and --claim_stale_seconds=600 (10min), another pod will '
+                             'steal mid-encode and you\'ll do double work. Default 600 targets '
+                             '~5min shards with 2x safety margin. Heartbeat interval is this / 10.')
+    parser.add_argument('--claim_pass_wait_seconds', type=float, default=0,
+                        help='After the first pass over all shards, if some are still claimed by '
+                             'other pods, wait this many seconds for them to commit or go stale '
+                             'and do another pass. 0 (default) means exit immediately — the user '
+                             'is expected to monitor the commit count and re-launch if needed. '
+                             'Set to e.g. 3600 for a fully-automatic "keep retrying for an hour" '
+                             'behavior.')
+    parser.add_argument('--max_aspect_ratio', type=float, default=200.0,
+                        help='Drop any sample that has at least one image with max(H,W)/min(H,W) '
+                             'strictly greater than this value (on the raw PIL size, before any '
+                             'resize). Default 200.0 matches transformers qwen2_vl.smart_resize '
+                             'MAX_RATIO, so surviving rows are guaranteed to be accepted by the '
+                             'processor at training time. Necessary because our preresize path '
+                             'bypasses the processor at encode time and would otherwise write '
+                             'shapes like (28, 19992) into the cache — legal numerically, but '
+                             'rejected by the processor during dataloader ingestion. Set to 0 '
+                             '(or negative) to disable the check entirely.')
     args = parser.parse_args()
+
+    if args.preresize_jpeg_quality is not None:
+        if not (1 <= args.preresize_jpeg_quality <= 100):
+            raise ValueError(
+                f'--preresize_jpeg_quality must be in [1, 100], got {args.preresize_jpeg_quality}.')
 
     if args.max_pixels is not None:
         _PROCESSOR_KWARGS['max_pixels'] = args.max_pixels
     if args.min_pixels is not None:
         _PROCESSOR_KWARGS['min_pixels'] = args.min_pixels
-    _get_processor(args.model)
+    main_processor = _get_processor(args.model)
+    main_ip = main_processor.image_processor
+    # Snapshot of the *effective* processor knobs at encode time. These are
+    # what _build_batch actually used; capturing them in cache_meta.json makes
+    # the cache self-describing so (a) training-time readers can reproduce
+    # identical n_pad / pixel_values, and (b) we can detect
+    # transformers-version drift (e.g. a default constant changed upstream)
+    # with a simple equality check at load time.
+    effective_processor = {
+        'merge_size': int(getattr(main_ip, 'merge_size', 2)),
+        'patch_size': int(getattr(main_ip, 'patch_size', 14)),
+        'min_pixels_eff': int(getattr(main_ip, 'min_pixels', 56 * 56)),
+        'max_pixels_eff': int(getattr(main_ip, 'max_pixels', 14 * 14 * 4 * 1280)),
+        'vocab_size': len(main_processor.tokenizer),
+    }
+    try:
+        import transformers  # noqa: E402
+        transformers_version = transformers.__version__
+    except Exception:
+        transformers_version = None
+    try:
+        import PIL  # noqa: E402
+        pil_version = PIL.__version__
+    except Exception:
+        pil_version = None
 
     # Base metadata describing this cache; written at cache root + per-shard.
-    # `store_mode` + `model` + (max_pixels, min_pixels) are what the training
-    # reader needs to reproduce the image_processor call that produced the
-    # authoritative ``image_grid_thw`` recorded in the Arrow dataset.
+    # `model` + (max_pixels, min_pixels) are what the training reader needs
+    # to reproduce the image_processor call that produced the authoritative
+    # ``image_grid_thw`` recorded in the Arrow dataset. `store_mode` is
+    # pinned to ``'image_bytes'``: kept in the schema so downstream code
+    # branching on it still works, but this script never writes the legacy
+    # pixel_values mode (removed in a cleanup pass).
     meta_base: Dict[str, Any] = {
         'full_encode': True,
         'packing': False,
-        'store_mode': args.store_mode,
+        'store_mode': 'image_bytes',
         'model': args.model,
         'source_dataset': args.source_dataset,
         'image_root': args.image_root,
         'max_pixels': args.max_pixels,
         'min_pixels': args.min_pixels,
         'max_length': args.max_length,
+        'shuffle_source': args.shuffle_source,
+        'seed': args.seed,
+        # New fields: let the training reader know whether stored image bytes
+        # are at source resolution (bit-exact) or at target resolution (JPEG
+        # re-encoded). Useful for debugging if pixel_values drift from an
+        # earlier run.
+        'preresize_jpeg_quality': args.preresize_jpeg_quality,
+        'drop_below_min_pixels': args.drop_below_min_pixels,
+        'max_aspect_ratio': args.max_aspect_ratio,
+        # Version + effective-processor snapshot. Training-time readers
+        # should assert the runtime `transformers.__version__` is compatible
+        # with this value; a mismatch is the most common cause of
+        # "silent n_pad drift" bugs where smart_resize's defaults change
+        # between versions.
+        'transformers_version': transformers_version,
+        'pil_version': pil_version,
+        'effective_processor': effective_processor,
     }
 
     dataset = load_from_disk(args.source_dataset)
     total_rows = len(dataset)
+
+    if args.shuffle_source:
+        # Source data is typically a concat of multiple sub-datasets, so
+        # contiguous row ranges tend to be homogeneous (e.g. all molecules,
+        # all photos). Without shuffling here, Step 1's shard-XXXXXX output
+        # sizes vary 2-5x because shard-level image resolution / count is
+        # correlated with source region. A global shuffle flattens that,
+        # producing uniform shard sizes and better packing load balance.
+        #
+        # `.shuffle()` only rewrites the HF index map, not the underlying
+        # Arrow files, so it's O(n) memory + near-free runtime even at 120M+
+        # rows. Downstream random reads are fine on SSD / fsx.
+        #
+        # IMPORTANT: this must be deterministic (fixed seed) so that resuming
+        # a crashed run hits the exact same shard → row assignment. `seed` is
+        # set via --seed; don't change it between runs.
+        dataset = dataset.shuffle(seed=args.seed)
+        print(f'[shuffle_source] applied global shuffle (seed={args.seed}) '
+              f'to {total_rows} rows')
 
     if args.offset or args.limit is not None:
         start = max(0, args.offset)
@@ -625,12 +1141,16 @@ def main():
     model_id = args.model
     image_root = args.image_root
     io_threads = args.io_threads
-    store_mode = args.store_mode
     max_length = args.max_length
+    preresize_jpeg_quality = args.preresize_jpeg_quality
+    drop_below_min_pixels = args.drop_below_min_pixels
+    # Normalize "disabled" to None so _build_batch only checks `is not None`.
+    max_aspect_ratio = args.max_aspect_ratio if args.max_aspect_ratio > 0 else None
 
     def _map_fn(batch):
         return _build_batch(
-            batch, model_id, image_root, strict, io_threads, store_mode, max_length)
+            batch, model_id, image_root, strict, io_threads, max_length,
+            preresize_jpeg_quality, drop_below_min_pixels, max_aspect_ratio)
 
     def _encode_and_save(src, out_dir, desc):
         """Apply map+filter to `src` and atomically materialize train[/val] subdirs at `out_dir`.
@@ -686,7 +1206,7 @@ def main():
         }
 
         train_n = val_n = 0
-        if args.val_ratio and args.val_ratio > 0 and len(processed) > 1:
+        if args.val_ratio > 0 and len(processed) > 1:
             split = processed.train_test_split(
                 test_size=args.val_ratio, seed=args.seed, shuffle=True)
             split['train'].save_to_disk(os.path.join(tmp_dir, 'train'), **save_kwargs)
@@ -710,113 +1230,184 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.shard_rows and args.shard_rows > 0:
-        # ---- shard mode: resumable, incremental ----
-        shard_rows = args.shard_rows
-        num_shards = math.ceil(len(dataset) / shard_rows)
-        shards_root = os.path.join(args.output_dir, 'shards')
-        os.makedirs(shards_root, exist_ok=True)
+    # Shard mode is the only supported mode: it's resumable, incremental and
+    # multi-pod-safe. The loop is structured as "scan all shards, claim +
+    # process whatever is free". Multiple pods pointed at the same
+    # output_dir cooperate via the filesystem-only protocol documented
+    # above the ``_try_claim_shard`` helper — no external coordinator.
+    if args.shard_rows <= 0:
+        raise ValueError(f'--shard_rows must be > 0, got {args.shard_rows}')
+    shard_rows = args.shard_rows
+    num_shards = math.ceil(len(dataset) / shard_rows)
+    shards_root = os.path.join(args.output_dir, 'shards')
+    os.makedirs(shards_root, exist_ok=True)
 
-        train_paths: List[str] = []
-        val_paths: List[str] = []
+    # Heartbeat cadence: 1/10th of the stale threshold. At the default
+    # --claim_stale_seconds=600 this is 60s, which is well within NFS
+    # metadata cache TTL (typically 30-60s) so other pods see fresh
+    # heartbeats. Don't lower much below ~10s: each heartbeat is a
+    # rename-in-place which, on large NFS mounts, costs ~50-200ms.
+    heartbeat_interval = max(5.0, args.claim_stale_seconds / 10.0)
+    host_tag = f'{socket.gethostname()}/{os.getpid()}'
+    print(f'[claim] this pod = {host_tag}, '
+          f'stale_threshold={args.claim_stale_seconds:.0f}s, '
+          f'heartbeat_interval={heartbeat_interval:.0f}s')
 
-        done, total_train, total_val = 0, 0, 0
-        wall_t0 = time.time()
+    train_paths: List[str] = []
+    val_paths: List[str] = []
+
+    total_train, total_val = 0, 0
+    committed_by_us = 0        # shards we personally encoded this run
+    committed_elsewhere = 0    # shards already done before we got here
+                               # (or committed by other pods mid-loop)
+    wall_t0 = time.time()
+
+    def _collect_shard_paths(shard_dir: str) -> None:
+        """Append this shard's train/val subdirs to the global lists if they exist."""
+        t_sub = os.path.join(shard_dir, 'train')
+        v_sub = os.path.join(shard_dir, 'val')
+        if os.path.exists(t_sub):
+            train_paths.append(t_sub)
+        if os.path.exists(v_sub):
+            val_paths.append(v_sub)
+
+    def _scan_pass(pass_label: str) -> int:
+        """Attempt to claim + process every shard once. Returns the number
+        of shards still in flight (claimed by someone else, not yet
+        committed) at the end of the pass."""
+        nonlocal total_train, total_val, committed_by_us, committed_elsewhere
+        still_in_flight = 0
         for i in range(num_shards):
-            shard_dir = os.path.join(shards_root, f'shard-{i:06d}-of-{num_shards:06d}')
-            train_sub = os.path.join(shard_dir, 'train')
-            val_sub = os.path.join(shard_dir, 'val')
+            shard_dir = os.path.join(
+                shards_root, f'shard-{i:06d}-of-{num_shards:06d}')
+            claim_dir = shard_dir + '.claim'
 
+            # Already committed (by us earlier, by another pod, or by a
+            # prior run). Record paths and move on.
             if os.path.exists(shard_dir):
-                # Shard was completed in a previous run. Skip re-computation;
-                # still record its paths so the summary / meta is correct.
-                if os.path.exists(train_sub):
-                    train_paths.append(train_sub)
-                if os.path.exists(val_sub):
-                    val_paths.append(val_sub)
-                done += 1
-                print(f'[shard {i+1}/{num_shards}] skip (already done): {shard_dir}')
+                _collect_shard_paths(shard_dir)
+                committed_elsewhere += 1
                 continue
 
-            start = i * shard_rows
-            end = min(start + shard_rows, len(dataset))
-            shard_src = dataset.select(range(start, end))
+            # Try to grab the shard. Failure here means either:
+            #   (a) another pod is actively working (fresh heartbeat), OR
+            #   (b) we raced a stealer and lost.
+            # Both are OK; we'll retry in a later pass if configured.
+            claimed = _try_claim_shard(
+                shard_dir, claim_dir, args.claim_stale_seconds)
+            if not claimed:
+                still_in_flight += 1
+                continue
 
-            t0 = time.time()
-            tn, vn = _encode_and_save(
-                shard_src, shard_dir, desc=f'shard {i+1}/{num_shards}')
-            dt = time.time() - t0
-            total_train += tn
-            total_val += vn
-            done += 1
-            if os.path.exists(train_sub):
-                train_paths.append(train_sub)
-            if os.path.exists(val_sub):
-                val_paths.append(val_sub)
+            # We own claim_dir. Start heartbeat BEFORE the expensive
+            # encode call so other pods see us alive the whole time.
+            stop_hb = _start_claim_heartbeat(claim_dir, heartbeat_interval)
 
-            # Simple ETA extrapolation across not-yet-done shards.
-            avg = (time.time() - wall_t0) / max(1, done)
-            remain = (num_shards - done) * avg
-            print(
-                f'[shard {i+1}/{num_shards}] done in {dt:.1f}s '
-                f'(train={tn}, val={vn}, avg={avg:.1f}s/shard, '
-                f'ETA={remain/3600:.1f}h) -> {shard_dir}')
+            try:
+                start = i * shard_rows
+                end = min(start + shard_rows, len(dataset))
+                shard_src = dataset.select(range(start, end))
 
-        meta = {
-            **meta_base,
-            'shard_rows': shard_rows,
-            'num_shards': num_shards,
-            'train_shard_paths': train_paths,
-            'val_shard_paths': val_paths,
-            'total_train_samples': total_train,
-            'total_val_samples': total_val,
-        }
-        meta_path = os.path.join(args.output_dir, 'cache_meta.json')
-        with open(meta_path, 'w') as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-        print(f'\ncache metadata: `{meta_path}`')
-        print(f'cached_dataset:     {len(train_paths)} shard paths (pass all to --cached_dataset)')
-        if val_paths:
-            print(f'cached_val_dataset: {len(val_paths)} shard paths (pass all to --cached_val_dataset)')
-        print('\nExample training command:')
+                t0 = time.time()
+                tn, vn = _encode_and_save(
+                    shard_src, shard_dir,
+                    desc=f'[{pass_label}] shard {i+1}/{num_shards} ({host_tag})')
+                dt = time.time() - t0
+                total_train += tn
+                total_val += vn
+                committed_by_us += 1
+                _collect_shard_paths(shard_dir)
+
+                done_total = committed_by_us + committed_elsewhere
+                # ETA uses only shards *we* did, since committed_elsewhere
+                # could have been completed at any wall-clock rate.
+                avg = ((time.time() - wall_t0) / committed_by_us
+                       if committed_by_us else 0.0)
+                remaining_estimate = (num_shards - done_total) * avg
+                print(
+                    f'[{pass_label}] shard {i+1}/{num_shards} done in {dt:.1f}s '
+                    f'(train={tn}, val={vn}, our_avg={avg:.1f}s/shard, '
+                    f'done_global={done_total}/{num_shards}, '
+                    f'ETA_if_alone={remaining_estimate/3600:.1f}h) -> {shard_dir}')
+            finally:
+                # Always release: even on exception, we must stop the
+                # heartbeat so other pods can eventually take over.
+                _release_claim(claim_dir, stop_hb)
+        return still_in_flight
+
+    still_in_flight = _scan_pass(pass_label='pass-1')
+
+    # Optional additional passes: wait for in-flight shards owned by other
+    # pods to either commit (skipped next pass) or go stale (stolen).
+    if still_in_flight > 0 and args.claim_pass_wait_seconds > 0:
+        wait_deadline = time.time() + args.claim_pass_wait_seconds
+        pass_idx = 2
         print(
-            '  --cached_dataset \\\n    ' +
-            ' \\\n    '.join(train_paths[:3]) +
-            (' ...' if len(train_paths) > 3 else ''))
-    else:
-        # ---- legacy single-pass mode ----
-        train_dir = os.path.join(args.output_dir, 'train')
-        val_dir = os.path.join(args.output_dir, 'val')
-        # Re-use _encode_and_save by pointing out_dir at a sibling that wraps
-        # both train/ and val/. That keeps atomicity semantics the same.
-        wrap_dir = os.path.join(args.output_dir, '_single')
-        if os.path.exists(wrap_dir):
-            shutil.rmtree(wrap_dir)
-        tn, vn = _encode_and_save(dataset, wrap_dir, desc='Encoding')
-        # Flatten into final train_dir / val_dir layout (compat with existing
-        # downstream code that expects {output_dir}/train and /val).
-        if os.path.exists(train_dir):
-            shutil.rmtree(train_dir)
-        os.rename(os.path.join(wrap_dir, 'train'), train_dir)
-        if os.path.exists(os.path.join(wrap_dir, 'val')):
-            if os.path.exists(val_dir):
-                shutil.rmtree(val_dir)
-            os.rename(os.path.join(wrap_dir, 'val'), val_dir)
-        shutil.rmtree(wrap_dir)
+            f'[claim] pass-1 complete: we committed {committed_by_us}, '
+            f'others had {committed_elsewhere}, {still_in_flight} still in '
+            f'flight. Waiting up to {args.claim_pass_wait_seconds:.0f}s for '
+            f'them to complete.')
+        while time.time() < wait_deadline and still_in_flight > 0:
+            # Sleep one heartbeat interval so we don't hammer the FS.
+            sleep_for = min(heartbeat_interval, wait_deadline - time.time())
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            still_in_flight = _scan_pass(pass_label=f'pass-{pass_idx}')
+            pass_idx += 1
 
-        print(f'cached_dataset: `{train_dir}` ({tn} samples)')
-        if vn:
-            print(f'cached_val_dataset: `{val_dir}` ({vn} samples)')
+    if still_in_flight > 0:
+        print(
+            f'[claim] warning: {still_in_flight} shards still claimed by '
+            f'other pods when we finished. They may still be working — '
+            f're-run this script when they finish to collect their output '
+            f'into the summary. Your own committed shards are safe on disk.')
 
-        meta = {
-            **meta_base,
-            'total_train_samples': tn,
-            'total_val_samples': vn,
-        }
-        meta_path = os.path.join(args.output_dir, 'cache_meta.json')
-        with open(meta_path, 'w') as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-        print(f'cache metadata: `{meta_path}`')
+    # Summary line covering the whole multi-pod picture:
+    #   committed_by_us   — we personally encoded these this run.
+    #   committed_elsewhere — shards already done when we saw them
+    #                         (prior runs or other pods).
+    #   still_in_flight   — shards not committed at script exit.
+    print(
+        f'\n[claim summary] committed_by_us={committed_by_us}, '
+        f'committed_elsewhere={committed_elsewhere}, '
+        f'still_in_flight={still_in_flight} (of {num_shards} total)')
+    print(
+        f'               our wall_clock = {(time.time() - wall_t0)/60:.1f} min, '
+        f'our throughput = {total_train} train + {total_val} val samples written.')
+
+    # cache_meta at the output_dir root. In a multi-pod scenario this is
+    # written by every pod on every run, last-writer-wins. That's OK:
+    # all pods compute identical meta_base (same args), and the shard
+    # path lists reflect what each pod can see on the shared FS at its
+    # exit time — which is only fully accurate for the *last* pod to
+    # finish. If you care about an authoritative final summary, re-run
+    # the script once after all pods have exited: every shard_dir will
+    # exist and the "scan" pass completes in seconds, producing a
+    # complete cache_meta.json.
+    meta = {
+        **meta_base,
+        'shard_rows': shard_rows,
+        'num_shards': num_shards,
+        'train_shard_paths': train_paths,
+        'val_shard_paths': val_paths,
+        'total_train_samples': total_train,  # only samples WE wrote
+        'total_val_samples': total_val,      # only samples WE wrote
+        'committed_by_this_pod': committed_by_us,
+        'committed_by_others_at_exit': committed_elsewhere,
+        'still_in_flight_at_exit': still_in_flight,
+    }
+    meta_path = os.path.join(args.output_dir, 'cache_meta.json')
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    print(f'\ncache metadata: `{meta_path}`')
+    print(f'cached_dataset:     {len(train_paths)} shard paths (pass all to --cached_dataset)')
+    if val_paths:
+        print(f'cached_val_dataset: {len(val_paths)} shard paths (pass all to --cached_val_dataset)')
+    print('\nExample training command:')
+    print(
+        '  --cached_dataset \\\n    ' +
+        ' \\\n    '.join(train_paths[:3]) +
+        (' ...' if len(train_paths) > 3 else ''))
 
 
 if __name__ == '__main__':

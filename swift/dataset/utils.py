@@ -275,6 +275,27 @@ class CachedEncodedDataset(Dataset):
                 f"cache_meta.json was found; image processing will be attempted with default "
                 f"image_processor settings and may produce DIFFERENT pixel_values from what "
                 f"the encode step used. Rebuild the cache or drop a cache_meta.json next to it.")
+        # transformers-version drift check. If the cache was encoded with a
+        # different transformers than we're running now, smart_resize default
+        # constants (IMAGE_FACTOR / MIN_PIXELS / MAX_PIXELS) could have
+        # shifted upstream, producing different image_grid_thw at runtime
+        # from what encode recorded — which in turn breaks n_pad alignment.
+        # We only WARN (not raise) because minor / patch version bumps
+        # rarely touch these constants; the warning directs the user to
+        # re-encode if they actually observe training-time issues.
+        if self._has_image_bytes_col and self._meta.get('transformers_version'):
+            try:
+                import transformers
+                runtime_ver = transformers.__version__
+            except Exception:
+                runtime_ver = None
+            cache_ver = self._meta.get('transformers_version')
+            if runtime_ver and cache_ver and runtime_ver != cache_ver:
+                logger.warning(
+                    f"transformers version mismatch for `{cache_path}`: "
+                    f"cache encoded with {cache_ver} but running {runtime_ver}. "
+                    f"If you see NaN loss or image_grid_thw / n_pad errors, "
+                    f"this is the most likely cause — re-encode with the current version.")
         # image_processor is loaded lazily, per-worker, on first image_bytes
         # row. This matters because dataloader workers are forked and we
         # don't want to pay the load cost in the parent.
