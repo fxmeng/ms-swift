@@ -434,12 +434,13 @@ def _build_batch(
     # defaults only if the processor somehow doesn't expose them.
     min_pixels_eff = int(getattr(ip, 'min_pixels', 56 * 56))
     max_pixels_eff = int(getattr(ip, 'max_pixels', 14 * 14 * 4 * 1280))
-    # Full vocab size (base vocab + added/special tokens). Used to catch
-    # pre-tokenized source rows that were produced with a different (larger)
-    # tokenizer: any id >= vocab_size would index out-of-bounds in the model's
-    # embedding table at training time, producing NaN loss on the whole batch
-    # (which, under mixed precision + expert parallelism, is very hard to
-    # trace back to a specific cached row).
+    # Full vocab size (base vocab + added/special tokens). Used by the OOV
+    # check in Pass 3 to validate the FINAL (post-_assemble_row) input_ids
+    # — i.e. tokens that will actually index the text embedding at forward
+    # time. Discrete image tokens from the separate image codebook are
+    # legitimately above ``vocab_size`` but are routed to ``discrete_tokens``
+    # by ``_assemble_row`` and never reach the text embedding, so running
+    # the check post-assembly is both simpler and semantically correct.
     vocab_size = len(processor.tokenizer)
 
     n = len(batch['input_ids'])
@@ -454,26 +455,14 @@ def _build_batch(
     dropped_parse = 0           # malformed <vision_start>/<vision_end> markers
     dropped_count_mismatch = 0  # #regions(input_ids) != #images(paths)
     dropped_stray_pad = 0       # <image_pad> outside any vision region
-    dropped_oov = 0             # input_ids contains id out of [0, vocab_size)
+    # OOV drops happen in Pass 3 on the final (post-_assemble_row) input_ids.
+    dropped_oov = 0
     for i in range(n):
         try:
             orig_input_ids = list(batch['input_ids'][i])
             images = batch['images'][i] or []
             if isinstance(images, str):
                 images = [images]
-            # Vocab-range check. ``max(orig_input_ids)`` is ~O(len) but pure
-            # C in CPython, so even at 4k tokens it's sub-microsecond. Do it
-            # before region parsing so we fail fast on garbage input_ids.
-            if orig_input_ids and (
-                    max(orig_input_ids) >= vocab_size or min(orig_input_ids) < 0):
-                dropped_oov += 1
-                if strict:
-                    raise ValueError(
-                        f'input_ids has out-of-vocab id: '
-                        f'min={min(orig_input_ids)} max={max(orig_input_ids)} '
-                        f'vocab_size={vocab_size}')
-                plans.append(None)
-                continue
             try:
                 regions = _parse_image_regions(orig_input_ids)
             except ValueError:
@@ -545,18 +534,6 @@ def _build_batch(
             if strict:
                 raise
             plans.append(None)
-
-    if dropped_parse or dropped_count_mismatch or dropped_stray_pad or dropped_oov:
-        # Worker-local one-liner; with num_proc=128 you get up to 128 of these
-        # per batch interval, which is fine — they let you spot systemic data
-        # issues early (e.g. a sub-dataset with a broken export). Aggregating
-        # across workers is non-trivial in datasets.map, skipped by design.
-        print(
-            f'[encode] batch size={n}: dropped '
-            f'{dropped_count_mismatch} (image count mismatch) + '
-            f'{dropped_parse} (malformed vision markers) + '
-            f'{dropped_stray_pad} (stray IMAGE_PAD_ID) + '
-            f'{dropped_oov} (out-of-vocab input_ids)')
 
     # Pass 2: flat (row_idx, img_idx, path) list, then parallel load.
     # `_load_image` returns {'pil': <Image>, 'raw': <bytes>} per image.
@@ -708,6 +685,29 @@ def _build_batch(
                 raw_bytes_list,
                 merge_len,
             )
+            # Vocab-range check on the FINAL input_ids. By this point
+            # ``_assemble_row`` has already routed discrete image tokens out
+            # of ``input_ids`` and into ``discrete_tokens``, so every id left
+            # in ``row_out['input_ids']`` is one of:
+            #   - a text token (must be in [0, vocab_size)), OR
+            #   - VISION_START_ID / VISION_END_ID / IMAGE_PAD_ID (special tokens
+            #     that live in the added-tokens range of the tokenizer and are
+            #     therefore < vocab_size by construction).
+            # Checking here — on the canonical output — avoids duplicating the
+            # region-walk in Pass 1 and keeps OOV detection semantically
+            # aligned with "what actually enters the model at forward time".
+            final_ids = row_out['input_ids']
+            if final_ids:
+                mn = min(final_ids)
+                mx = max(final_ids)
+                if mn < 0 or mx >= vocab_size:
+                    dropped_oov += 1
+                    if strict:
+                        raise ValueError(
+                            f'post-assembly input_ids has out-of-vocab id: '
+                            f'min={mn} max={mx} vocab_size={vocab_size}')
+                    _append_none()
+                    continue
             # Drop rows whose encoded length exceeds max_length. The training
             # loader (swift/pipelines/utils.py `_select_dataset`) applies the
             # exact same filter: max(lengths) <= max_length. Pre-filtering
@@ -718,7 +718,7 @@ def _build_batch(
             # the dataset as "modified" at training time and silently skip
             # the precomputed packing cache. This is NOT treated as a strict
             # failure; it's an expected soft drop.
-            if max_length is not None and len(row_out['input_ids']) > max_length:
+            if max_length is not None and len(final_ids) > max_length:
                 _append_none()
                 continue
             for k in out:
@@ -727,6 +727,18 @@ def _build_batch(
             if strict:
                 raise
             _append_none()
+
+    if dropped_parse or dropped_count_mismatch or dropped_stray_pad or dropped_oov:
+        # Worker-local one-liner; with num_proc=128 you get up to 128 of these
+        # per batch interval, which is fine — they let you spot systemic data
+        # issues early (e.g. a sub-dataset with a broken export). Aggregating
+        # across workers is non-trivial in datasets.map, skipped by design.
+        print(
+            f'[encode] batch size={n}: dropped '
+            f'{dropped_count_mismatch} (image count mismatch) + '
+            f'{dropped_parse} (malformed vision markers) + '
+            f'{dropped_stray_pad} (stray IMAGE_PAD_ID) + '
+            f'{dropped_oov} (out-of-vocab input_ids)')
 
     return out
 
